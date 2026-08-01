@@ -1,0 +1,28 @@
+# Groq free tier, three small tasks, single repeat.
+#
+# Sized for the constraint rather than the model: the on-demand tier allows 8,000
+# tokens per minute *including* requested completion tokens, which leaves ~2,400 for
+# conversation history. That rules out the multi-file tasks — they cannot fit — and
+# it means a multi-turn task spends real wall-clock waiting for the quota window.
+#
+# The mock arm is the free control: same tasks, no network, so a difference between
+# the two rows is the model rather than the harness.
+
+experiment: groq-free
+suite: default
+repeats: 1
+
+tasks:
+  - fix_failing_test
+  - structural_function
+  - find_the_bug
+
+arms:
+  - name: mock-control
+    provider: mock
+    mock_mode: echo
+
+  - name: gpt-oss-120b
+    provider: groq
+    model: openai/gpt-oss-120b
+    tool_verbosity: terse

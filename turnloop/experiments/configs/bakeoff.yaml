@@ -1,0 +1,50 @@
+# Provider bake-off: the same tasks across every backend.
+#
+# Cost warning. The `glm` arm runs on a self-hosted 4xH200 endpoint at $18.16/hour
+# with a ~29 minute cold boot. The runner groups execution by provider precisely so
+# this arm boots once and then runs everything, instead of paying a cold boot per
+# task. Even so: `modal app stop glm-5-2-serve` afterwards.
+#
+# Ordering note: `glm` is listed last, but the runner sorts mock first and otherwise
+# alphabetically, so provider grouping — not arm order — determines execution.
+
+experiment: provider-bakeoff
+suite: default
+repeats: 3
+
+tasks:
+  - fix_failing_test
+  - implement_from_spec
+  - multi_file_rename
+  - add_cli_flag
+  - grep_then_edit
+  - structural_function
+  - find_the_bug
+  - refuse_outside_root
+
+arms:
+  - name: sonnet
+    provider: anthropic
+    model: claude-sonnet-4-5
+
+  - name: haiku
+    provider: anthropic
+    model: claude-haiku-4-5
+
+  - name: gpt-4.1
+    provider: openai
+    model: gpt-4.1
+
+  - name: gemini-flash
+    provider: gemini
+    model: gemini-2.5-flash
+
+  - name: gpt-oss-120b
+    provider: groq
+    model: openai/gpt-oss-120b
+
+  # Self-hosted GLM-5.2, 744B MoE at W4A16 on 4xH200. 65k context, so it also
+  # exercises the compaction path that the hosted arms mostly never reach.
+  - name: glm-5.2-selfhosted
+    provider: glm
+    tool_verbosity: terse

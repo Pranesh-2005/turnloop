@@ -1,0 +1,26 @@
+# Difficulty calibration for the five ceiling-breaker tasks.
+#
+# Each of these has a plausible wrong solution baked in (see default.yaml's
+# "ceiling-breakers" section), but "has a decoy" is a design intent, not a
+# measurement. This config exists to check the intent held: run each task a
+# few times against a real model and see where the pass rate lands.
+#
+# Target band is 40-70% per task. Below that and the task is just hard, not
+# discriminating; above it and the decoy isn't tempting enough to matter.
+# One arm, three repeats, cheap enough to iterate on the fixtures themselves
+# before trusting them in a bigger sweep.
+
+experiment: hard-calibration
+suite: default
+repeats: 3
+
+tasks:
+  - regression_trap
+  - cross_file_contract
+  - subtle_spec_edge
+  - circular_import
+  - misleading_traceback
+
+arms:
+  - name: gpt-4o-mini
+    provider: blaxel

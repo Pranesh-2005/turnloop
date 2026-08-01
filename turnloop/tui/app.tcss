@@ -1,0 +1,84 @@
+Screen {
+    layers: base modal;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+.msg {
+    margin-bottom: 1;
+}
+
+.msg.user {
+    color: $text;
+    background: $boost;
+    padding: 0 1;
+}
+
+.msg.assistant {
+    color: $text;
+}
+
+.msg.thinking {
+    color: $text-muted;
+    padding-left: 2;
+}
+
+.msg.thinking.collapsed {
+    display: none;
+}
+
+.msg.tool {
+    padding-left: 1;
+    margin-bottom: 0;
+}
+
+.msg.note {
+    color: $text-muted;
+}
+
+.msg.error {
+    color: $error;
+}
+
+#boot {
+    display: none;
+    height: auto;
+    padding: 1 2;
+    border: round $warning;
+    margin: 1 2;
+}
+
+#status {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+#prompt {
+    border: none;
+    border-top: solid $primary;
+    height: 3;
+}
+
+#permission-box {
+    layer: modal;
+    width: 80%;
+    max-width: 100;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+    border: round $warning;
+    background: $surface;
+}
+
+#permission-body {
+    height: auto;
+}
+
+#permission-keys {
+    height: auto;
+}

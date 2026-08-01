@@ -1,0 +1,44 @@
+# Tool-calling reliability.
+#
+# There is no separate measurement harness: ToolRunner.dispatch already records
+# every unknown-tool, invalid-JSON and schema-violation failure as a typed metric,
+# so this config is just the ordinary suite run with the report read differently.
+#
+# The number that actually distinguishes models is not the error rate — everything
+# emits a bad call eventually — it is the recovery rate: after a rejected call, does
+# the model read the error and fix the argument shape, or does it repeat itself?
+#
+# The mock-chaos arm is the control. Its failure rates are known by construction, so
+# if the report disagrees with them, the measurement is wrong rather than the model.
+
+experiment: tool-reliability
+suite: default
+repeats: 5
+
+tasks:
+  - structural_function
+  - implement_from_spec
+  - grep_then_edit
+  - multi_file_rename
+
+arms:
+  - name: mock-chaos-control
+    provider: mock
+    mock_mode: chaos
+
+  - name: glm-5.2-nim
+    provider: nvidia
+
+  - name: gpt-oss-120b
+    provider: groq
+    model: openai/gpt-oss-120b
+
+  # The self-hosted GLM arm is deliberately absent. It is the interesting
+  # comparison — vLLM's glm47 parser assembling tool calls from streamed
+  # fragments, versus NIM emitting each call whole in a single delta — but the
+  # Modal endpoint bills $18.16/hr wall clock from cold boot, so it is opt-in
+  # only. Add it back explicitly when you mean to spend that:
+  #
+  #   - name: glm-5.2-selfhosted
+  #     provider: glm
+  #     tool_verbosity: terse

@@ -1,0 +1,31 @@
+# Does a weaker model break the ceiling?
+#
+# GLM-5.2 scored 100% on all four of these tasks across 84 runs, which means no
+# context-engineering ablation run against it can discriminate — every arm ties at
+# the top. An ablation needs a model that sometimes fails.
+#
+# This is the cheapest possible test of whether gpt-4o-mini sits in the useful band.
+# One repeat, four tasks, one arm. What we want is a pass rate somewhere around
+# 40-70%: high enough that the agent is genuinely working, low enough that removing
+# the system prompt or the tool descriptions has room to show up.
+#
+# 0% would be as useless as 100% — a floor is just a ceiling upside down.
+#
+# Note `forces_compaction` will NOT trigger compaction here. The bulky fixture is
+# sized against a 65,536-token window (tier 3 at ~43k); gpt-4o-mini's 128k window
+# puts the trigger near 90k, which the fixture's top-3-files-in-full total of ~50k
+# does not reach. That task measures only correctness on this provider.
+
+experiment: ceiling-check
+suite: default
+repeats: 1
+
+tasks:
+  - fix_failing_test
+  - implement_from_spec
+  - grep_then_edit
+  - forces_compaction
+
+arms:
+  - name: gpt-4o-mini
+    provider: blaxel

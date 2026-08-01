@@ -1,0 +1,22 @@
+# Pipeline smoke test. No network, no cost, runs in seconds.
+#
+# The chaos arm is the point: it emits malformed tool arguments, truncated JSON and
+# unknown tool names on purpose, which is how the harness's "dispatch never raises"
+# guarantee gets exercised rather than merely asserted.
+
+experiment: smoke
+suite: default
+repeats: 1
+
+tasks:
+  - find_the_bug
+  - refuse_outside_root
+
+arms:
+  - name: mock-baseline
+    provider: mock
+    mock_mode: echo
+
+  - name: mock-chaos
+    provider: mock
+    mock_mode: chaos

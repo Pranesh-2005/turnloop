@@ -1,0 +1,65 @@
+# Context-engineering ablations, all on one model so the model is not the variable.
+#
+# The model is GLM-5.2 via NVIDIA NIM: a 200k window, which is what makes these
+# ablations runnable at all. `forces_compaction` and the multi-file tasks cannot
+# be expressed inside the 7k the Groq free tier allows.
+#
+# Three questions, and the reason each is worth asking:
+#
+# 1. Tool-description verbosity. Verbose descriptions cost ~1,100 tokens more than
+#    terse ones with the current 10-tool set. On a 65k window that is 2% of
+#    everything. If pass rate is unchanged, terse is free money; if it drops, the
+#    descriptions are load-bearing and that is worth knowing too.
+#
+# 2. Compaction strategy. `summarize` spends a model call; `micro_only` spends
+#    nothing but forgets more; `none` is the control that shows what compaction is
+#    actually buying.
+#
+# 3. System prompt variant. `minimal` strips the behavioral guidance down to two
+#    sentences. This measures how much of a coding agent's competence comes from
+#    its harness rather than its weights — the single most interesting number here.
+
+experiment: context-engineering
+suite: default
+repeats: 3
+
+tasks:
+  - fix_failing_test
+  - implement_from_spec
+  - grep_then_edit
+  - forces_compaction
+
+arms:
+  - name: baseline
+    provider: nvidia
+    tool_verbosity: normal
+    compaction: summarize
+    system_variant: default
+
+  - name: terse-tools
+    provider: nvidia
+    tool_verbosity: terse
+    compaction: summarize
+    system_variant: default
+
+  - name: verbose-tools
+    provider: nvidia
+    tool_verbosity: verbose
+    compaction: summarize
+    system_variant: default
+
+  - name: micro-only-compaction
+    provider: nvidia
+    compaction: micro_only
+
+  - name: no-compaction
+    provider: nvidia
+    compaction: none
+
+  - name: minimal-prompt
+    provider: nvidia
+    system_variant: minimal
+
+  - name: careful-prompt
+    provider: nvidia
+    system_variant: careful

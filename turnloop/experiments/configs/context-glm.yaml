@@ -1,0 +1,59 @@
+# context.yaml, retargeted at the self-hosted GLM-5.2 on Modal.
+#
+# Same seven arms and four tasks as context.yaml; only the provider differs. This
+# exists as a separate file rather than an edit because the two endpoints are not
+# interchangeable: NIM gives a 200k window for free but rate-limits hard, while this
+# one gives 65,536 tokens on a GPU billed at $18.16/hour of wall clock.
+#
+# 65k is the window the compaction ladder was designed against, so `forces_compaction`
+# is a real test here rather than a formality -- on a 200k window it barely triggers.
+#
+# COST: 84 runs at roughly 30s each is about 45 minutes of GPU, so on the order of
+# $13, on top of whatever the cold boot already cost. Only run this in an already-warm
+# window, and run `modal app stop glm-5-2-serve` the moment it finishes -- the
+# container otherwise idles for another 10 minutes before scaling down.
+
+experiment: context-engineering-glm
+suite: default
+repeats: 3
+
+tasks:
+  - fix_failing_test
+  - implement_from_spec
+  - grep_then_edit
+  - forces_compaction
+
+arms:
+  - name: baseline
+    provider: glm
+    tool_verbosity: normal
+    compaction: summarize
+    system_variant: default
+
+  - name: terse-tools
+    provider: glm
+    tool_verbosity: terse
+    compaction: summarize
+    system_variant: default
+
+  - name: verbose-tools
+    provider: glm
+    tool_verbosity: verbose
+    compaction: summarize
+    system_variant: default
+
+  - name: micro-only-compaction
+    provider: glm
+    compaction: micro_only
+
+  - name: no-compaction
+    provider: glm
+    compaction: none
+
+  - name: minimal-prompt
+    provider: glm
+    system_variant: minimal
+
+  - name: careful-prompt
+    provider: glm
+    system_variant: careful

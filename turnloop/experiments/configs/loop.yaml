@@ -1,0 +1,34 @@
+# Agent-loop variants on identical tasks.
+#
+# All three arms run the same harness and the same model; only the instruction
+# scaffolding differs. That is deliberate — if the loops were separate code paths,
+# a difference between arms could be a difference in implementation quality rather
+# than in strategy.
+#
+# What to look for: fan-out should win on wall-clock for the multi-file tasks and
+# lose on token cost (every subagent re-pays for the system prompt and tool
+# schemas). Plan-then-execute should show more turns and better pass rates on the
+# tasks with several steps.
+
+experiment: loop-variants
+suite: default
+repeats: 3
+
+tasks:
+  - multi_file_rename
+  - grep_then_edit
+  - find_the_bug
+  - fix_failing_test
+
+arms:
+  - name: single
+    provider: nvidia
+    loop_variant: single
+
+  - name: fanout
+    provider: nvidia
+    loop_variant: fanout
+
+  - name: plan-then-execute
+    provider: nvidia
+    loop_variant: plan_then_execute

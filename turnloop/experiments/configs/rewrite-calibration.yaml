@@ -1,0 +1,24 @@
+# Difficulty calibration for the two rewritten tasks.
+#
+# `misleading_traceback` and `subtle_spec_edge` were both 3/3 for gpt-4o-mini in
+# their original form — solved every time by the *weaker* model, so they measured
+# nothing. Both were rebuilt around bugs that are plausible rather than famous:
+# the old ones failed because "basis points vs percent" and "median averages the
+# middle two" are cases every model has seen hundreds of times.
+#
+# Five repeats rather than three: the question here is specifically where in the
+# 0-100% band these land, and n=3 cannot distinguish 33% from 60%.
+#
+# Free arm, so the only cost is wall clock.
+
+experiment: rewrite-calibration
+suite: default
+repeats: 5
+
+tasks:
+  - misleading_traceback
+  - subtle_spec_edge
+
+arms:
+  - name: gpt-4o-mini
+    provider: blaxel

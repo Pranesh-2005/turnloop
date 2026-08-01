@@ -1,0 +1,36 @@
+# Same model weights, two serving stacks.
+#
+# GLM-5.2 self-hosted on vLLM (Modal, `--tool-call-parser glm47`) against the same
+# GLM-5.2 hosted on NVIDIA NIM. The model is held constant, so any difference in
+# tool-calling reliability is attributable to the serving stack rather than to the
+# weights -- which is the only way to measure a parser.
+#
+# The two stacks demonstrably differ on the wire: NIM emits each tool call whole in
+# a single delta (id + name + complete arguments JSON), while vLLM's glm47 parser
+# streams the arguments as fragments to be accumulated by index. Whether that costs
+# reliability is the question this run answers.
+#
+# COST: the self-hosted arm bills $18.16/hour of wall clock from cold boot, and the
+# container idles down after 10 minutes. Keep this config small and run it only in
+# a window where the endpoint is already warm. Nine runs is roughly six minutes of
+# GPU. Run `modal app stop glm-5-2-serve` when finished.
+#
+# Arms are executed grouped by provider, so the GPU arm runs its tasks back to back
+# inside one warm window instead of cold-booting per task.
+
+experiment: glm-selfhosted-vs-nim
+suite: default
+repeats: 3
+
+tasks:
+  - fix_failing_test
+  - structural_function
+  - find_the_bug
+
+arms:
+  - name: glm-5.2-nim
+    provider: nvidia
+
+  - name: glm-5.2-selfhosted
+    provider: glm
+    tool_verbosity: terse

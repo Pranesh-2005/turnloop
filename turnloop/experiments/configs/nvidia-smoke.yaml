@@ -1,0 +1,22 @@
+# Cheapest possible proof that the NVIDIA NIM arm is wired correctly end to end.
+#
+# Three tasks, one repeat, one real arm plus the mock control. The control is not
+# decoration: if the graders are broken, `mock-control` passes too, and a green
+# column means nothing. Run this before any full sweep.
+
+experiment: nvidia-smoke
+suite: default
+repeats: 1
+
+tasks:
+  - fix_failing_test
+  - structural_function
+  - find_the_bug
+
+arms:
+  - name: mock-control
+    provider: mock
+    mock_mode: echo
+
+  - name: glm-5.2-nim
+    provider: nvidia

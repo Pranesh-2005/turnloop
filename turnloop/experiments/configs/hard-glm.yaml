@@ -1,0 +1,41 @@
+# The five ceiling-breaker tasks against the real target model.
+#
+# Calibration happens on Blaxel (free, ~5s/request); this config exists to confirm
+# the difficulty transfers to GLM-5.2, which is the model the project actually
+# targets. A task tuned to trip gpt-4o-mini is not automatically hard for a
+# stronger model, and a suite calibrated against the wrong model measures nothing.
+#
+# Two arms so the comparison is in one table: the self-hosted GPU and the same five
+# tasks on Blaxel. Provider grouping means the GPU arm runs its 15 back to back
+# inside a single warm window rather than cold-booting per task.
+#
+# COST: 15 GPU runs at roughly a minute each is ~15 minutes, about $4.50, plus the
+# cold boot (~29 min / ~$9) if the container is not already up. Only run this in an
+# already-warm window, and run `modal app stop glm-5-2-serve -y` the moment it
+# finishes — the container idles a further 10 minutes before scaling down on its own.
+
+experiment: hard-glm
+suite: default
+repeats: 3
+
+# Three of the five, not all five. Calibration on gpt-4o-mini put
+# `misleading_traceback` and `subtle_spec_edge` at 3/3 — a task the *weaker* model
+# solves every time cannot discriminate on the stronger one, so paying GPU minutes
+# to watch GLM-5.2 also score 100% buys nothing.
+#
+# The three kept are the ones whose answer is genuinely unknown: `regression_trap`
+# landed at 1/3 (already in band), and the two that floored at 0/3 are the real
+# question — difficulty is model-relative, so a task a weak model never solves may
+# sit squarely in the useful band for a stronger one.
+tasks:
+  - regression_trap
+  - cross_file_contract
+  - circular_import
+
+arms:
+  - name: gpt-4o-mini
+    provider: blaxel
+
+  - name: glm-5.2-selfhosted
+    provider: glm
+    tool_verbosity: terse
