@@ -18,7 +18,7 @@ permission system people disable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from turnloop.tools.base import Tool
 
 
-class Verdict(str, Enum):
+class Verdict(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
@@ -60,7 +60,7 @@ class PermissionRequest:
     subagent_id: str | None = None
 
 
-class Scope(str, Enum):
+class Scope(StrEnum):
     ONCE = "once"
     SESSION = "session"
     PROJECT = "project"  # persisted to .turnloop/settings.local.json

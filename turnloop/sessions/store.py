@@ -209,7 +209,7 @@ class SessionStore:
                     except Exception:  # noqa: BLE001 - skip a corrupt line, keep the session
                         continue
                 elif kind == "compaction":
-                    lo, hi = (payload.get("replaced") or [0, 0])[:2]
+                    _lo, hi = (payload.get("replaced") or [0, 0])[:2]
                     tail = messages[hi:]
                     summary = payload.get("summary", "")
                     messages = (

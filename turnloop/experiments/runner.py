@@ -343,7 +343,10 @@ async def _run_one(arm: Arm, task: TaskSpec, repeat: int, settings: Settings,
 
     trace = _collect_trace(agent)
     session_path = getattr(agent.store, "path", None)
-    if session_path is not None and Path(session_path).is_file():
+    # ASYNC240 is suppressed below: this is a stat and a copy of one small JSONL,
+    # at a run boundary with no turn in flight. Threading it would add machinery
+    # to avoid a block that cannot happen.
+    if session_path is not None and Path(session_path).is_file():  # noqa: ASYNC240
         trace_dir = run_dir / "trace"
         trace_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(session_path, trace_dir / f"{arm.name}__{task.id}__{repeat}.jsonl")

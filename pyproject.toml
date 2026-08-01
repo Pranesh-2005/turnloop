@@ -35,8 +35,11 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "pytest-textual-snapshot>=1.0",
-  "ruff>=0.6",
-  "mypy>=1.11",
+  # Pinned to a minor range, not floated. Ruff adds lint rules in minor releases,
+  # so `>=0.6` means a build that is green today goes red tomorrow with no commit
+  # in between — which is how this CI first broke. Bump deliberately.
+  "ruff>=0.16.1,<0.17",
+  "mypy>=1.11,<2",
 ]
 
 [project.scripts]
