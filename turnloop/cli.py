@@ -79,7 +79,28 @@ def _cli_overrides(args: argparse.Namespace) -> dict:
     return out
 
 
+def _survive_a_narrow_console() -> None:
+    """Degrade unencodable glyphs instead of crashing the process.
+
+    Windows picks cp1252 for a pipe or a redirect, and cp1252 cannot encode the
+    arrows, check marks and box-drawing characters this CLI prints. A single
+    stray glyph then takes down the whole command with a UnicodeEncodeError —
+    which is how `doctor` died the moment anyone redirected it to a file to send
+    to somebody else. Replacement characters are a bad look; a traceback instead
+    of the diagnostics is worse.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass  # already detached, or not a real stream under a test harness
+
+
 def main(argv: list[str] | None = None) -> int:
+    _survive_a_narrow_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     cwd = (getattr(args, "cwd", None) or Path.cwd()).resolve()

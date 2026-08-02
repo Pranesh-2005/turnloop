@@ -199,3 +199,58 @@ def test_default_deny_rules_cover_secrets_and_catastrophes(tmp_path):
     deny = load_settings(tmp_path).permissions.deny
     assert any(".env" in rule for rule in deny)
     assert any("rm -rf" in rule for rule in deny)
+
+def test_doctor_survives_a_console_that_cannot_encode_its_glyphs(tmp_path, capsys):
+    """Windows picks cp1252 for a pipe, and cp1252 has no U+2212 or U+2192.
+
+     shipped a real minus sign and died with a UnicodeEncodeError the
+    moment its output was redirected to a file — the exact moment someone is
+    capturing it to send to somebody else. The fix is a stdout guard rather than
+    hunting glyphs one at a time, because tool output and MCP servers can emit
+    characters this repo does not control.
+    """
+    import io
+    import sys
+
+    from turnloop.cli import main
+
+    narrow = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    real = sys.stdout
+    sys.stdout = narrow
+    try:
+        rc = main(["doctor", "--cwd", str(tmp_path)])
+    finally:
+        sys.stdout = real
+
+    narrow.flush()
+    assert rc in (0, 1)  # findings are allowed; a crash is not
+    body = narrow.buffer.getvalue().decode("cp1252")
+    assert "context budget" in body
+
+
+def test_the_console_guard_replaces_a_glyph_cp1252_cannot_encode():
+    """The doctor fix removed one glyph; the guard covers every future one.
+
+    Tool results, MCP servers and slash commands all print characters this repo
+    does not control, so keeping every string inside cp1252 is not a maintainable
+    invariant. Degrading to `?` is.
+    """
+    import io
+    import sys
+
+    from turnloop.cli import _survive_a_narrow_console
+
+    narrow = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = narrow
+    try:
+        with pytest.raises(UnicodeEncodeError):
+            narrow.write("→")
+            narrow.flush()
+        _survive_a_narrow_console()
+        narrow.write("budget − reserve → history\n")
+        narrow.flush()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+
+    assert "budget ? reserve ? history" in narrow.buffer.getvalue().decode("cp1252")

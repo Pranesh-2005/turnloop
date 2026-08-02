@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnloop"
-version = "0.1.1"
+version = "0.1.2"
 description = "A local-first agentic coding harness: streaming tool loop, permission gating, context compaction, subagents, and any LLM provider."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,7 +39,9 @@ dev = [
   # so `>=0.6` means a build that is green today goes red tomorrow with no commit
   # in between — which is how this CI first broke. Bump deliberately.
   "ruff>=0.16.1,<0.17",
-  "mypy>=1.11,<2",
+  # Must match what is actually run locally, or CI type-checks with a different
+  # tool than the author does — which is exactly how this broke.
+  "mypy>=2.1,<3",
 ]
 
 [project.scripts]

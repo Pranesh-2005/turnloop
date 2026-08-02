@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from turnloop.config import Settings, Verbosity
 from turnloop.core.events import ToolProgress
-from turnloop.core.messages import ToolSpec
+from turnloop.core.messages import ImageBlock, ToolSpec
 
 if TYPE_CHECKING:  # avoid an import cycle: sessions imports messages, not tools
     from turnloop.permissions.engine import PermissionDecision, PermissionEngine, PermissionRequest
@@ -50,6 +50,10 @@ class ToolOutput:
     display: str | None = None
     is_error: bool = False
     metrics: dict[str, Any] = field(default_factory=dict)
+    # Rides alongside the tool_result as a sibling content block rather than
+    # inside `content` — that field is `str` and the whole tool contract (every
+    # provider adapter, every log line) depends on it staying that way.
+    image: ImageBlock | None = None
 
     @classmethod
     def error(cls, message: str, **metrics) -> ToolOutput:

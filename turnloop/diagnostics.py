@@ -155,8 +155,12 @@ def _context_rows(settings: Settings, cwd: Path) -> list[tuple[str, str, str]]:
         (
             OK,
             "context budget",
-            f"{caps.max_context:,} window − {reserve:,} output − {system_tokens:,} system "
-            f"− {tools_tokens:,} tools = {available:,} for history",
+            # ASCII hyphens, not U+2212. cp1252 cannot encode a real minus sign,
+            # so this line crashed `doctor` outright whenever stdout was a pipe or
+            # a redirect on Windows — precisely when someone is capturing the
+            # output to send to somebody else.
+            f"{caps.max_context:,} window - {reserve:,} output - {system_tokens:,} system "
+            f"- {tools_tokens:,} tools = {available:,} for history",
         ),
         (OK, "tool verbosity", verbosity),
     ]

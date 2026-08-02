@@ -21,6 +21,7 @@ from turnloop.tools.skill import SkillTool
 from turnloop.tools.task import TaskTool
 from turnloop.tools.todo import TodoWriteTool
 from turnloop.tools.webfetch import WebFetchTool
+from turnloop.tools.websearch import WebSearchTool
 from turnloop.tools.write import WriteTool
 
 
@@ -45,6 +46,7 @@ def build_registry(settings: Settings, cwd: Path | None = None, *,
         registry.add(AskUserQuestionTool())
     if include_web:
         registry.add(WebFetchTool())
+        registry.add(WebSearchTool())
 
     from turnloop.commands.loader import load_skills
 

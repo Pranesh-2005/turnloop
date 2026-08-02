@@ -77,6 +77,13 @@ class BashConfig(BaseModel):
     max_output_lines: int = 2_000
 
 
+class SearchConfig(BaseModel):
+    # "ddg" needs no key and is what makes WebSearch usable with zero config;
+    # the keyed backends are opt-in upgrades, not requirements.
+    backend: Literal["ddg", "brave", "tavily"] = "ddg"
+    api_key_env: str | None = None
+
+
 class CompactionConfig(BaseModel):
     enabled: bool = True
     thinking_drop_pressure: float = 0.60
@@ -120,6 +127,7 @@ class Settings(BaseModel):
     permissions: PermissionConfig = Field(default_factory=PermissionConfig)
 
     bash: BashConfig = Field(default_factory=BashConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
     hooks: dict[str, list[HookMatcher]] = Field(default_factory=dict)
@@ -205,14 +213,14 @@ def default_providers() -> dict[str, ProviderConfig]:
             kind="anthropic",
             model="claude-sonnet-4-5",
             api_key_env="ANTHROPIC_API_KEY",
-            caps=preset_for("claude-sonnet-4-5"),
+            caps=preset_for("claude-sonnet-4-5").model_copy(update={"supports_vision": True}),
         ),
         "openai": ProviderConfig(
             kind="openai_compat",
             model="gpt-4.1",
             base_url="https://api.openai.com/v1",
             api_key_env="OPENAI_API_KEY",
-            caps=preset_for("gpt-4.1"),
+            caps=preset_for("gpt-4.1").model_copy(update={"supports_vision": True}),
         ),
         "groq": ProviderConfig(
             kind="openai_compat",
@@ -226,9 +234,13 @@ def default_providers() -> dict[str, ProviderConfig]:
         ),
         "gemini": ProviderConfig(
             kind="gemini",
-            model="gemini-2.5-pro",
+            # An alias, not a pinned version. `gemini-2.5-pro` has a free-tier quota
+            # of exactly zero, so a new key 429s on the first request, and pinned
+            # flash versions get retired for new keys and 404 — both look like a
+            # broken adapter rather than a model that moved. The alias follows.
+            model="gemini-flash-latest",
             api_key_env="GEMINI_API_KEY",
-            caps=preset_for("gemini-2.5-pro"),
+            caps=preset_for("gemini-2.5-pro").model_copy(update={"supports_vision": True}),
         ),
         "ollama": ProviderConfig(
             kind="openai_compat",

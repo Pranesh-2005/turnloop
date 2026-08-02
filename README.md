@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~18,000 lines of Python, 233 tests, no network in the default test run.
+~18,000 lines of Python, 249 tests, no network in the default test run.
 
 ---
 
@@ -183,18 +183,36 @@ Custom commands live in `.turnloop/commands/*.md`.
 - **`TURNLOOP.md`** at the project root for standing instructions (`CLAUDE.md` and
   `AGENTS.md` are also read)
 - **Text files of any kind** via the `Read` tool — source, JSON, YAML, CSV, Markdown
+- **Images** — PNG, JPEG, GIF and WEBP via `Read`, detected by magic bytes rather
+  than extension, on providers whose `Capabilities.supports_vision` is true
+  (Anthropic, OpenAI, Gemini). On a text-only provider `Read` refuses the image and
+  names the provider, instead of sending a payload the model cannot parse — which
+  matters here, because GLM-5.2 W4A16 as deployed is text-only.
 
-**Not supported:** images (there is no image content block in the message model —
-only `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`) and binary
-files (refused by a null-byte sniff, which covers PDFs, `.docx`, archives and
-images-on-disk). Anything convertible on the command line comes back in scope,
-because `Bash` exists: `pdftotext spec.pdf -` and the agent will reach for it itself.
+**Not supported:** binary files other than those image formats — refused by a
+null-byte sniff, which covers PDFs, `.docx` and archives. Anything convertible on
+the command line comes back in scope, because `Bash` exists: `pdftotext spec.pdf -`
+and the agent will reach for it itself.
 
 ### Tools
 
-Ten registered: `Read` `Write` `Edit` `Glob` `Grep` `Bash` `TodoWrite` `Task`
-`WebFetch` `AskUserQuestion`. Schemas are generated from pydantic models, so the
-declared schema and the validation are the same object and cannot drift.
+Eleven registered: `Read` `Write` `Edit` `Glob` `Grep` `Bash` `TodoWrite` `Task`
+`WebFetch` `WebSearch` `AskUserQuestion`, plus `Skill` when the project has skills.
+Schemas are generated from pydantic models, so the declared schema and the
+validation are the same object and cannot drift.
+
+`WebSearch` and `WebFetch` are the pair: search finds URLs, fetch reads one. Both
+are `read_only` and `parallel_safe`, so they work in plan mode and run concurrently
+with `Read`/`Grep`. **Search needs no API key** — the default DuckDuckGo backend
+works on a fresh install with an empty config. Brave and Tavily are opt-in upgrades:
+
+```json
+{ "search": { "backend": "brave", "api_key_env": "BRAVE_API_KEY" } }
+```
+
+A keyed backend only errors if you actually select one, so the zero-config path
+never breaks. Results are budgeted for a small window — 10 results maximum,
+200-character snippets, 4k characters total, roughly 1k tokens against GLM's 65k.
 
 ---
 
@@ -205,8 +223,8 @@ turnloop/
   core/         messages, events, token estimation, ids
   providers/    anthropic · openai_compat (GLM/Groq/NVIDIA/vLLM) · gemini · mock
                 + sse parser, pricing/capability presets, registry
-  tools/        Read Edit Write Bash Glob Grep TodoWrite Task WebFetch Ask Skill
-                + runner, shell scanner, text io
+  tools/        Read Edit Write Bash Glob Grep TodoWrite Task WebFetch WebSearch
+                Ask Skill + runner, shell scanner, text io
   permissions/  rule grammar, matcher, engine
   agent/        loop, system prompt, subagents, factory, headless
   context/      budget, three-tier compaction, memory files
@@ -344,7 +362,7 @@ All nine ship preconfigured. `doctor` shows which have keys present.
 | `groq` | openai_compat | `openai/gpt-oss-120b` | `GROQ_API_KEY` | free tier: 8k TPM |
 | `anthropic` | anthropic | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` | |
 | `openai` | openai_compat | `gpt-4.1` | `OPENAI_API_KEY` | |
-| `gemini` | gemini | `gemini-2.5-pro` | `GEMINI_API_KEY` | |
+| `gemini` | gemini | `gemini-flash-latest` | `GEMINI_API_KEY` | alias, not a pin — see below |
 | `blaxel` | openai_compat | `gpt-4o-mini` | `BL_API_KEY` | sandbox; ignores the model field |
 | `ollama` | openai_compat | `qwen2.5-coder:14b` | none | local |
 
@@ -372,6 +390,15 @@ smoke tests, not for experiments.
 `"glm-5.2" in "z-ai/glm-5.2"` is `True`, so without an explicit `PRESETS` key the
 NVIDIA model would silently inherit the self-hosted 65k window and $18.16/hr cost
 basis. A regression test guards it.
+
+**Gemini's default model is an alias because pinned ones rot in two different ways.**
+0.1.1 shipped `gemini-2.5-pro`, whose free-tier quota is literally zero: a brand-new
+key gets `429 ... generate_content_free_tier_input_token_count, limit: 0` on its first
+request, which reads as a broken adapter rather than a model that was never free.
+Pinning `gemini-2.5-flash` instead fails the other way — `404 no longer available to
+new users`. `gemini-flash-latest` follows Google's own pointer. Worth knowing when
+reading a 429 from any provider: the status code says "slow down", the body says
+whether slowing down will ever help.
 
 ---
 
@@ -806,7 +833,7 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 233 tests, no network
+pytest                    # 249 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
@@ -815,13 +842,14 @@ mypy turnloop
 |---|---|---|
 | `test_permissions.py` | 48 | rule grammar, compound-command splitting, mode enforcement |
 | `test_experiments.py` | 36 | runner, graders, report, suite invariants, config resolution |
-| `test_providers.py` | 27 | adapters against recorded `.sse` fixtures |
-| `test_tools_files.py` | 25 | Read/Write/Edit/Glob/Grep, encodings, newline preservation |
+| `test_providers.py` | 31 | adapters against recorded `.sse` fixtures, image block encoding |
+| `test_tools_files.py` | 28 | Read/Write/Edit/Glob/Grep, encodings, newlines, image detection |
 | `test_loop.py` | 20 | streaming, truncation, iteration cap |
 | `test_hooks_mcp_commands.py` | 20 | lifecycle hooks, MCP client, slash commands |
 | `test_config.py` | 19 | layering, env overrides, capability presets |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
 | `test_bash.py` | 14 | shell selection, process-tree kill |
+| `test_websearch.py` | 9 | HTML parsing, backend selection, truncation, failure modes |
 | `test_tui.py` | 8 | Textual snapshots |
 
 `conftest.py` monkeypatches httpx's transport to raise unless a test is marked
@@ -860,7 +888,8 @@ sessions wrongly.
 
 API keys come from the environment or a `.env` at the project root. A real environment
 variable always wins over the file, and `doctor` reports which key *names* were loaded
-— never their values.
+— never their values. This applies to `search.api_key_env` exactly as it does to a
+provider's: settings files name the variable, never the secret.
 
 Project instructions go in `TURNLOOP.md` (`CLAUDE.md` and `AGENTS.md` are also read).
 Slash commands live in `.turnloop/commands/*.md`, skills in
@@ -878,13 +907,23 @@ just because it is on disk.
 
 Stated rather than buried:
 
-- **No image support.** No image content block exists in the message model. Adding one
-  is small (three adapters, a `supports_vision` flag, `Read` returning it instead of
-  refusing) but useless on the primary target — GLM-5.2 W4A16 as deployed is text-only.
-- **No binary file support.** Null-byte sniff refuses them. Convert via `Bash`.
-- **The Anthropic, Gemini and OpenAI adapters are fixture-tested but have never sent a
-  real request.** They are coded against the documented wire format and pass against
-  recorded SSE, which is not the same as verified.
+- **Image support is verified on two of three encoders.** The `openai_compat` data-URL
+  path and Gemini's `inline_data` path both round-trip a real image live; Anthropic's
+  is still fixture-only. None of it can be exercised on the primary target, since
+  GLM-5.2 W4A16 as deployed is text-only.
+- **No binary file support** beyond those image formats. Null-byte sniff refuses the
+  rest. Convert via `Bash`.
+- **`WebSearch`'s default backend parses HTML, not an API.** DuckDuckGo will rate-limit
+  and will eventually change its markup; both are handled as distinct, actionable
+  errors rather than a crash, but a keyed backend is the durable choice for anything
+  that matters. That trade is deliberate: the default has to work with no key at all.
+- **The Anthropic adapter is fixture-tested but has never sent a real request.** It is
+  coded against the documented wire format and passes against recorded SSE, which is not
+  the same as verified. It is now the only one: the Gemini adapter is verified live
+  (text, tool calls and images on `gemini-flash-latest`), and OpenAI needs no separate
+  verification because `openai` is `kind="openai_compat"` — the same adapter Groq,
+  NVIDIA, Ollama, Blaxel and the self-hosted GLM endpoint all run through, making it
+  the most exercised code path in the repo.
 - **`subtle_spec_edge` currently passes for nobody** (0/5 on gpt-4o-mini). The rewrite
   overshot — runs die on collection errors and leave `NotImplementedError`, which is
   failure-to-produce-working-code, not falling for the decoy. It needs another pass.

@@ -2,14 +2,37 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from turnloop.core.messages import ImageBlock
 from turnloop.tools.base import Tool, ToolContext, ToolOutput
 
 MAX_LINE_CHARS = 2_000
 BINARY_SNIFF_BYTES = 8_000
+
+ImageMediaType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
+
+# Signature bytes, checked before the extension is trusted at all — a renamed
+# file lies about its type, but its first bytes do not.
+_IMAGE_SIGNATURES: tuple[tuple[bytes, ImageMediaType], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _detect_image(raw: bytes) -> ImageMediaType | None:
+    for sig, media_type in _IMAGE_SIGNATURES:
+        if raw.startswith(sig):
+            return media_type
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 class ReadArgs(BaseModel):
@@ -40,7 +63,8 @@ Read a file from the filesystem.
   to page through it rather than reading it whole — a big file consumes context
   you will need later.
 - You must Read a file before you Edit or Write it.
-- Binary files are refused rather than dumped.
+- PNG/JPEG/GIF/WEBP images are returned as an image, not text. Other binary
+  files are refused rather than dumped.
 """,
         "verbose": """
 Read a file from the filesystem.
@@ -58,8 +82,11 @@ Behavior and constraints:
 - Reading a file records it as seen. Write and Edit both refuse to touch a file
   that has not been read in this session, and refuse again if it changed on disk
   afterwards — re-read it in that case.
-- Binary files (detected by NUL bytes) are refused with their size and type
-  rather than being dumped into the conversation.
+- PNG/JPEG/GIF/WEBP files are detected by magic bytes (not by extension) and
+  returned as an image, if the active provider supports vision; otherwise the
+  call is refused with a message naming the provider.
+- Other binary files (detected by NUL bytes) are refused with their size and
+  type rather than being dumped into the conversation.
 - Directories are refused; use Glob or Grep to explore instead.
 - Paths outside the project root are refused unless the user configured
   additional directories.
@@ -81,6 +108,26 @@ Behavior and constraints:
             return ToolOutput.error(f"{path} does not exist." + (f" {hint}" if hint else ""))
 
         raw = path.read_bytes()
+
+        # Checked before the NUL-byte binary sniff below: a real PNG/JPEG is
+        # binary and would otherwise be refused as "looks binary" instead of
+        # being recognized as an image.
+        if media_type := _detect_image(raw):
+            caps = ctx.settings.provider_config(ctx.session.provider).caps
+            if not caps.supports_vision:
+                return ToolOutput.error(
+                    f"{path.name} is a {media_type} image, but the active provider "
+                    f"({ctx.session.provider}) has no vision support and cannot parse "
+                    "one. Ask the user to describe it, or switch to a vision-capable "
+                    "provider."
+                )
+            return ToolOutput(
+                content=f"Read {path.name} as an image ({media_type}, {len(raw):,} bytes).",
+                display=f"Read {_rel(path, ctx.root)} (image, {len(raw):,} bytes)",
+                image=ImageBlock(media_type=media_type, data=base64.b64encode(raw).decode("ascii")),
+                metrics={"bytes": len(raw)},
+            )
+
         if b"\x00" in raw[:BINARY_SNIFF_BYTES]:
             return ToolOutput.error(
                 f"{path.name} looks binary ({len(raw):,} bytes). Not reading it as text."

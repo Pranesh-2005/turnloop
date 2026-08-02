@@ -47,6 +47,33 @@ async def test_read_suggests_close_names(ctx, project):
     assert out.is_error and "config.py" in out.content
 
 
+async def test_read_returns_an_image_on_a_vision_provider(ctx, project):
+    ctx.session.provider = "anthropic"  # configured with supports_vision=True
+    (project / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    out = await read(ctx, "pic.png")
+    assert not out.is_error
+    assert out.image is not None
+    assert out.image.media_type == "image/png"
+
+
+async def test_read_refuses_an_image_on_a_non_vision_provider(ctx, project):
+    """GLM is text-only; sending it an image payload would just get rejected."""
+    ctx.session.provider = "glm"
+    (project / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    out = await read(ctx, "pic.png")
+    assert out.is_error
+    assert "glm" in out.content and "vision" in out.content
+    assert out.image is None
+
+
+async def test_image_detection_goes_by_magic_bytes_not_a_lying_extension(ctx, project):
+    ctx.session.provider = "anthropic"
+    (project / "not_really.txt").write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)  # JPEG signature
+    out = await read(ctx, "not_really.txt")
+    assert not out.is_error
+    assert out.image.media_type == "image/jpeg"
+
+
 async def test_partial_read_does_not_authorize_an_edit(ctx, project):
     """A read of lines 1-2 must not license an edit against unseen lines."""
     (project / "a.py").write_text("\n".join(f"line{i}" for i in range(50)), encoding="utf-8")

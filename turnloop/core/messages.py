@@ -75,6 +75,19 @@ class ToolUseBlock(BaseModel):
     args: dict = Field(default_factory=dict)
 
 
+class ImageBlock(BaseModel):
+    """An image, base64-inlined.
+
+    Restricted to the four media types every one of Anthropic/OpenAI/Gemini
+    accepts unconditionally — a fifth type might work on one provider and 400 on
+    another, and this union has no way to know which adapter will see it.
+    """
+
+    type: Literal["image"] = "image"
+    media_type: Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
+    data: str  # base64-encoded, no data: URL prefix
+
+
 class ToolResultBlock(BaseModel):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
@@ -88,7 +101,7 @@ class ToolResultBlock(BaseModel):
 
 
 ContentBlock: TypeAlias = Annotated[
-    TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock,
+    TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | ImageBlock,
     Field(discriminator="type"),
 ]
 

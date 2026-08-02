@@ -32,6 +32,7 @@ from turnloop.core.events import (
 )
 from turnloop.core.messages import (
     ContentBlock,
+    ImageBlock,
     Message,
     TextBlock,
     ThinkingBlock,
@@ -142,6 +143,11 @@ class AnthropicProvider(Provider):
             return {"type": "thinking", "thinking": block.text, "signature": block.signature}
         if isinstance(block, ToolUseBlock):
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.args}
+        if isinstance(block, ImageBlock):
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": block.media_type, "data": block.data},
+            }
         if isinstance(block, ToolResultBlock):
             return {
                 "type": "tool_result",

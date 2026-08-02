@@ -46,6 +46,11 @@ class Capabilities(BaseModel):
     supports_system_role: bool = True
     supports_tool_choice: bool = True
     supports_temperature: bool = True
+    # Whether the endpoint can parse an image content block at all. False by
+    # default so a new provider entry is text-only until proven otherwise —
+    # GLM-5.2 W4A16 as deployed is exactly that case, and sending it an image
+    # payload gets a rejection, not a graceful ignore.
+    supports_vision: bool = False
 
     # Per-million-token pricing. Zero means "unknown/free".
     price_in_per_mtok: float = 0.0

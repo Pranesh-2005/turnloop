@@ -37,6 +37,7 @@ from turnloop.core.events import (
 from turnloop.core.ids import new_id
 from turnloop.core.messages import (
     ContentBlock,
+    ImageBlock,
     Message,
     TextBlock,
     ThinkingBlock,
@@ -121,13 +122,16 @@ class OpenAICompatProvider(Provider):
         return out
 
     def _user_to_wire(self, msg: Message) -> list[dict]:
-        """Split a user message into tool results plus any remaining text.
+        """Split a user message into tool results plus any remaining text/images.
 
         Tool results must each become their own `role: "tool"` message, and they
         have to precede any user text in the same turn or providers complain
-        about a tool_call without a matching response.
+        about a tool_call without a matching response. Images cannot ride inside
+        a tool message on this API — only a `user` message accepts `image_url`
+        parts — so an ImageBlock sibling becomes a trailing `user` message with
+        array-form content instead.
         """
-        tool_msgs = [
+        tool_msgs: list[dict] = [
             {
                 "role": "tool",
                 "tool_call_id": b.tool_use_id,
@@ -137,7 +141,15 @@ class OpenAICompatProvider(Provider):
             if isinstance(b, ToolResultBlock)
         ]
         text = "".join(b.text for b in msg.content if isinstance(b, TextBlock)).strip()
-        if text:
+        images = [b for b in msg.content if isinstance(b, ImageBlock)]
+        if images:
+            parts: list[dict] = [{"type": "text", "text": text}] if text else []
+            parts.extend(
+                {"type": "image_url", "image_url": {"url": f"data:{img.media_type};base64,{img.data}"}}
+                for img in images
+            )
+            tool_msgs.append({"role": "user", "content": parts})
+        elif text:
             tool_msgs.append({"role": "user", "content": text})
         return tool_msgs
 

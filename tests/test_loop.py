@@ -171,7 +171,7 @@ async def test_unknown_tool_returns_an_error_result_listing_valid_names(ctx, per
 
     registry = build_registry(ctx.settings, ctx.cwd)
     runner = ToolRunner(registry, permissions)
-    result = await runner.dispatch(ToolUseBlock(id="c1", name="Nope", args={}), ctx)
+    result = (await runner.dispatch(ToolUseBlock(id="c1", name="Nope", args={}), ctx))[0]
 
     assert result.is_error and "Read" in result.content
     assert runner.error_counts() == {ERROR_UNKNOWN_TOOL: 1}
@@ -184,7 +184,7 @@ async def test_malformed_json_arguments_are_reported_as_such(ctx, permissions):
     block = ToolUseBlock(
         id="c1", name="Read", args={"_raw": "{bad", "_parse_error": "arguments were not valid JSON"}
     )
-    result = await runner.dispatch(block, ctx)
+    result = (await runner.dispatch(block, ctx))[0]
 
     assert result.is_error and "not valid JSON" in result.content
     assert runner.error_counts() == {ERROR_BAD_JSON: 1}
@@ -194,9 +194,9 @@ async def test_schema_violations_pass_pydantic_text_through(ctx, permissions):
     from turnloop.tools.builtin import build_registry
 
     runner = ToolRunner(build_registry(ctx.settings, ctx.cwd), permissions)
-    result = await runner.dispatch(
-        ToolUseBlock(id="c1", name="Read", args={"wrong_field": 1}), ctx
-    )
+    result = (
+        await runner.dispatch(ToolUseBlock(id="c1", name="Read", args={"wrong_field": 1}), ctx)
+    )[0]
 
     assert result.is_error
     assert "file_path" in result.content
@@ -219,7 +219,7 @@ async def test_a_crashing_tool_becomes_an_error_result(ctx, permissions):
             raise RuntimeError("kaboom")
 
     runner = ToolRunner(ToolRegistry([Exploding()]), permissions)
-    result = await runner.dispatch(ToolUseBlock(id="c1", name="Boom", args={}), ctx)
+    result = (await runner.dispatch(ToolUseBlock(id="c1", name="Boom", args={}), ctx))[0]
 
     assert result.is_error and "kaboom" in result.content
     assert "tool_crash" in runner.error_counts()
@@ -233,9 +233,11 @@ async def test_declined_permission_tells_the_model_not_to_retry(ctx, permissions
     ctx = ctx.child(ask=channel.ask)
     runner = ToolRunner(build_registry(ctx.settings, ctx.cwd), permissions)
 
-    result = await runner.dispatch(
-        ToolUseBlock(id="c1", name="Write", args={"file_path": "new.txt", "content": "x"}), ctx
-    )
+    result = (
+        await runner.dispatch(
+            ToolUseBlock(id="c1", name="Write", args={"file_path": "new.txt", "content": "x"}), ctx
+        )
+    )[0]
 
     assert result.is_error and "Do not retry" in result.content
     assert runner.error_counts() == {ERROR_DENIED: 1}

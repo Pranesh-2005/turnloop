@@ -20,11 +20,19 @@ from turnloop.core.events import (
     ThinkingDelta,
     ToolUseArgsDelta,
 )
-from turnloop.core.messages import Message, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock
+from turnloop.core.messages import (
+    ImageBlock,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from turnloop.errors import ColdBootTimeout
 from turnloop.providers import base as base_module
 from turnloop.providers.anthropic import AnthropicProvider
 from turnloop.providers.base import Capabilities, CompletionRequest, classify_error
+from turnloop.providers.gemini import GeminiProvider
 from turnloop.providers.openai_compat import OpenAICompatProvider, _parse_args
 from turnloop.providers.sse import iter_sse
 
@@ -189,6 +197,61 @@ async def test_a_400_is_fatal_and_surfaces_the_body():
 )
 def test_parse_args_never_raises(raw, expected_keys):
     assert set(_parse_args(raw)) == expected_keys
+
+
+# --------------------------------------------------------------------------
+# ImageBlock
+# --------------------------------------------------------------------------
+
+
+def test_image_block_round_trips_through_the_content_block_union():
+    msg = Message(role="user", content=[ImageBlock(media_type="image/png", data="abc123")])
+    restored = Message.model_validate(msg.model_dump(mode="json"))
+    block = restored.content[0]
+    assert isinstance(block, ImageBlock)
+    assert block.media_type == "image/png"
+    assert block.data == "abc123"
+
+
+async def test_anthropic_encodes_an_image_block_as_a_base64_source():
+    provider = anthropic_provider()
+    history = [Message(role="user", content=[ImageBlock(media_type="image/png", data="abc123")])]
+    wire = provider.to_wire_messages(history)
+    assert wire[0]["content"][0] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "abc123"},
+    }
+
+
+async def test_openai_compat_encodes_an_image_block_as_a_data_url():
+    provider = glm_provider()
+    history = [
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="c1", content="read it"),
+                ImageBlock(media_type="image/jpeg", data="xyz789"),
+            ],
+        )
+    ]
+    wire = provider.to_wire_messages(CompletionRequest(messages=history))
+    # The tool result and the image cannot share one message: only a `user`
+    # message accepts `image_url` parts on this API.
+    assert [m["role"] for m in wire] == ["tool", "user"]
+    image_part = wire[-1]["content"][-1]
+    assert image_part == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,xyz789"},
+    }
+
+
+async def test_gemini_encodes_an_image_block_as_inline_data():
+    provider = GeminiProvider(
+        name="gemini", model="gemini-2.5-pro", caps=Capabilities(), api_key="k",
+    )
+    history = [Message(role="user", content=[ImageBlock(media_type="image/webp", data="qqq")])]
+    contents = provider.to_wire_contents(history)
+    assert contents[0]["parts"][0] == {"inline_data": {"mime_type": "image/webp", "data": "qqq"}}
 
 
 # --------------------------------------------------------------------------

@@ -20,7 +20,7 @@ import anyio
 from pydantic import ValidationError
 
 from turnloop.core.events import ToolFinished, ToolStarted
-from turnloop.core.messages import ToolResultBlock, ToolUseBlock
+from turnloop.core.messages import ContentBlock, ToolResultBlock, ToolUseBlock
 from turnloop.permissions.engine import (
     PermissionDecision,
     PermissionEngine,
@@ -59,7 +59,7 @@ class ToolRunner:
         self.ui = ui
         self.records: list[ToolCallRecord] = []
 
-    async def dispatch(self, block: ToolUseBlock, ctx: ToolContext) -> ToolResultBlock:
+    async def dispatch(self, block: ToolUseBlock, ctx: ToolContext) -> list[ContentBlock]:
         started = time.monotonic()
         ctx = ctx.child(tool_use_id=block.id)
 
@@ -166,12 +166,17 @@ class ToolRunner:
                          ctx.subagent_id)
         )
 
-        return ToolResultBlock(
-            tool_use_id=block.id,
-            content=output.content,
-            is_error=output.is_error,
-            display=output.display,
-        )
+        result: list[ContentBlock] = [
+            ToolResultBlock(
+                tool_use_id=block.id,
+                content=output.content,
+                is_error=output.is_error,
+                display=output.display,
+            )
+        ]
+        if output.image is not None:
+            result.append(output.image)
+        return result
 
     # --- helpers -----------------------------------------------------------
 
@@ -189,7 +194,7 @@ class ToolRunner:
         return await ctx.ask(request)
 
     async def _fail(self, block: ToolUseBlock, ctx: ToolContext, kind: str, message: str,
-                    started: float, tool: Tool | None = None) -> ToolResultBlock:
+                    started: float, tool: Tool | None = None) -> list[ContentBlock]:
         duration = time.monotonic() - started
         name = tool.name if tool else block.name
         self._record(name, False, kind, duration, {})
@@ -198,9 +203,9 @@ class ToolRunner:
                 name, {"ok": False, "error_kind": kind, "duration_s": round(duration, 4)}
             )
         await self._emit(ToolFinished(block.id, name, True, None, duration, ctx.subagent_id))
-        return ToolResultBlock(
-            tool_use_id=block.id, content=message, is_error=True, display=message
-        )
+        return [
+            ToolResultBlock(tool_use_id=block.id, content=message, is_error=True, display=message)
+        ]
 
     def _record(self, name: str, ok: bool, kind: str | None, duration: float,
                 metrics: dict) -> None:

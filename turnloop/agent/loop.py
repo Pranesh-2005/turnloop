@@ -42,7 +42,7 @@ from turnloop.core.events import (
     TurnFinished,
     TurnStarted,
 )
-from turnloop.core.messages import ContentBlock, Message, TextBlock, ToolResultBlock, ToolUseBlock
+from turnloop.core.messages import ContentBlock, Message, TextBlock, ToolUseBlock
 from turnloop.errors import FatalProviderError, ProviderError
 from turnloop.permissions.engine import PermissionEngine, Verdict
 from turnloop.providers.base import CompletionRequest, Provider
@@ -269,15 +269,20 @@ class AgentLoop:
 
     # --- tool execution ----------------------------------------------------
 
-    async def _execute_tools(self, blocks: list[ToolUseBlock]) -> list[ToolResultBlock]:
-        """Run the requested tools, in parallel only when that is clearly safe."""
+    async def _execute_tools(self, blocks: list[ToolUseBlock]) -> list[ContentBlock]:
+        """Run the requested tools, in parallel only when that is clearly safe.
+
+        Each dispatch returns a small list (a `tool_result`, plus an `ImageBlock`
+        sibling when the tool produced one) rather than a single block, so the
+        two are flattened back together here in call order.
+        """
         if not self.provider.caps.supports_parallel_tool_calls and len(blocks) > 1:
             # The model cannot represent several results in one turn; answer the
             # first and let it ask again.
             blocks = blocks[:1]
 
         if len(blocks) > 1 and self._safe_to_parallelize(blocks):
-            results: dict[str, ToolResultBlock] = {}
+            results: dict[str, list[ContentBlock]] = {}
 
             async def run_one(block: ToolUseBlock) -> None:
                 results[block.id] = await self.runner.dispatch(block, self._tool_context())
@@ -288,9 +293,15 @@ class AgentLoop:
 
             # Restore the model's ordering: Gemini in particular rejects results
             # that do not line up with the calls it made.
-            return [results[b.id] for b in blocks if b.id in results]
+            ordered: list[ContentBlock] = []
+            for b in blocks:
+                ordered.extend(results.get(b.id, []))
+            return ordered
 
-        return [await self.runner.dispatch(block, self._tool_context()) for block in blocks]
+        sequential: list[ContentBlock] = []
+        for block in blocks:
+            sequential.extend(await self.runner.dispatch(block, self._tool_context()))
+        return sequential
 
     def _safe_to_parallelize(self, blocks: list[ToolUseBlock]) -> bool:
         for block in blocks:

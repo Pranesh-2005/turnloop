@@ -27,6 +27,7 @@ from turnloop.core.events import (
 from turnloop.core.ids import new_id
 from turnloop.core.messages import (
     ContentBlock,
+    ImageBlock,
     Message,
     TextBlock,
     ThinkingBlock,
@@ -101,6 +102,10 @@ class GeminiProvider(Provider):
                 elif isinstance(block, ToolUseBlock):
                     call_names[block.id] = block.name
                     parts.append({"functionCall": {"name": block.name, "args": block.args}})
+                elif isinstance(block, ImageBlock):
+                    parts.append(
+                        {"inline_data": {"mime_type": block.media_type, "data": block.data}}
+                    )
                 elif isinstance(block, ToolResultBlock):
                     name = call_names.get(block.tool_use_id, "unknown_tool")
                     content = (
