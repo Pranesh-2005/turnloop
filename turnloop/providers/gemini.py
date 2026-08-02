@@ -101,7 +101,12 @@ class GeminiProvider(Provider):
                         parts.append({"text": block.text})
                 elif isinstance(block, ToolUseBlock):
                     call_names[block.id] = block.name
-                    parts.append({"functionCall": {"name": block.name, "args": block.args}})
+                    part: dict = {"functionCall": {"name": block.name, "args": block.args}}
+                    # Sibling of functionCall, not nested inside it — matches how
+                    # the API returns it (see decode in _Accumulator.feed below).
+                    if block.signature:
+                        part["thoughtSignature"] = block.signature
+                    parts.append(part)
                 elif isinstance(block, ImageBlock):
                     parts.append(
                         {"inline_data": {"mime_type": block.media_type, "data": block.data}}
@@ -192,7 +197,10 @@ class _Accumulator:
                     events.append(TextDelta(text))
                 elif call := part.get("functionCall"):
                     block = ToolUseBlock(
-                        id=new_id("call"), name=call.get("name", ""), args=call.get("args") or {}
+                        id=new_id("call"),
+                        name=call.get("name", ""),
+                        args=call.get("args") or {},
+                        signature=part.get("thoughtSignature") or None,
                     )
                     self.calls.append(block)
                     events.append(

@@ -73,6 +73,13 @@ class ToolUseBlock(BaseModel):
     id: str
     name: str
     args: dict = Field(default_factory=dict)
+    # Gemini's thoughtSignature, opaque token tying a functionCall to the
+    # reasoning that produced it. Must be echoed back verbatim on the next
+    # request or the API 400s ("Function call is missing a thought_signature")
+    # on turn two of any tool conversation. Mirrors ThinkingBlock.signature:
+    # other providers never set it, so it stays None and their wire builders
+    # — which construct dicts field-by-field, not via model_dump — never see it.
+    signature: str | None = None
 
 
 class ImageBlock(BaseModel):

@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~18,000 lines of Python, 249 tests, no network in the default test run.
+~18,000 lines of Python, 255 tests, no network in the default test run.
 
 ---
 
@@ -88,7 +88,7 @@ point.
 Verify:
 
 ```bash
-tl --version                # turnloop 0.1.0
+tl --version                # turnloop 0.1.3
 tl doctor                   # every provider, key presence, shell, context budget
 ```
 
@@ -97,7 +97,7 @@ tl doctor                   # every provider, key presence, shell, context budge
 context arithmetic for the active provider:
 
 ```
- + context budget     32,000 window − 4,096 output − 835 system − 3,365 tools = 23,704 for history
+ + context budget     32,000 window - 4,096 output - 881 system - 3,567 tools = 23,456 for history
 ```
 
 ---
@@ -399,6 +399,12 @@ Pinning `gemini-2.5-flash` instead fails the other way — `404 no longer availa
 new users`. `gemini-flash-latest` follows Google's own pointer. Worth knowing when
 reading a 429 from any provider: the status code says "slow down", the body says
 whether slowing down will ever help.
+
+Its free tier is **5 requests per minute**, which an agent loop reaches in one
+ordinary task — a fix-two-bugs-and-write-tests run spent six turns and died on the
+seventh. The retry ladder is correct and still loses, because the window is longer
+than the backoff. Free Gemini is a good way to try the harness and a bad way to do
+sustained work.
 
 ---
 
@@ -796,10 +802,31 @@ suddenly have them exposed.
 never manifested only because `rg` was not installed on the machine and it had been
 falling back to a pure-Python walk.
 
-**The lesson, three times over in one project:** an 84-run sweep failing while
-printing a tidy report of zeros; a tool returning empty with `ok: true`; a sweep
-sitting at 10/18 doing nothing for 25 minutes. Each was caught only by looking past
-the summary line.
+**The Gemini adapter passed a live test and was still broken.**
+
+Gemini returns a `thoughtSignature` alongside each `functionCall` part. Replay the
+assistant turn without it and the next request is rejected: `400 — Function call is
+missing a thought_signature in functionCall parts`. The adapter decoded the call and
+dropped the signature, so **turn two of every tool conversation failed**.
+
+It was verified live before shipping — one text turn, one tool call, both correct —
+and that verification is exactly what hid the bug. A single tool call never replays
+anything. The failure needs a *second* request carrying the first one's output, which
+is the first thing a real agent loop does and the last thing a smoke test does.
+
+Found by setting the harness up as a user would and giving it an ordinary task, not by
+testing the adapter. The signature now round-trips through `ToolUseBlock.signature`
+and through session JSONL, so a `--resume`d conversation does not hit the same wall.
+
+**0.1.2 shipped with this bug.** It went to PyPI on the strength of the single-turn
+check, and anyone who pointed 0.1.2 at Gemini got one working tool call and then a
+400. Fixed in 0.1.3.
+
+**The lesson, four times over in one project:** an 84-run sweep failing while printing
+a tidy report of zeros; a tool returning empty with `ok: true`; a sweep sitting at
+10/18 doing nothing for 25 minutes; an adapter passing its live test and failing on
+the turn the test never made. Each was caught only by looking past the summary line —
+and the last one only by using the thing instead of testing it.
 
 ---
 
@@ -833,7 +860,7 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 249 tests, no network
+pytest                    # 255 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
@@ -842,11 +869,11 @@ mypy turnloop
 |---|---|---|
 | `test_permissions.py` | 48 | rule grammar, compound-command splitting, mode enforcement |
 | `test_experiments.py` | 36 | runner, graders, report, suite invariants, config resolution |
-| `test_providers.py` | 31 | adapters against recorded `.sse` fixtures, image block encoding |
+| `test_providers.py` | 35 | adapters vs recorded `.sse`, image blocks, thought signatures |
 | `test_tools_files.py` | 28 | Read/Write/Edit/Glob/Grep, encodings, newlines, image detection |
 | `test_loop.py` | 20 | streaming, truncation, iteration cap |
 | `test_hooks_mcp_commands.py` | 20 | lifecycle hooks, MCP client, slash commands |
-| `test_config.py` | 19 | layering, env overrides, capability presets |
+| `test_config.py` | 21 | layering, env overrides, presets, narrow-console guard |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
 | `test_bash.py` | 14 | shell selection, process-tree kill |
 | `test_websearch.py` | 9 | HTML parsing, backend selection, truncation, failure modes |
@@ -919,11 +946,13 @@ Stated rather than buried:
   that matters. That trade is deliberate: the default has to work with no key at all.
 - **The Anthropic adapter is fixture-tested but has never sent a real request.** It is
   coded against the documented wire format and passes against recorded SSE, which is not
-  the same as verified. It is now the only one: the Gemini adapter is verified live
-  (text, tool calls and images on `gemini-flash-latest`), and OpenAI needs no separate
-  verification because `openai` is `kind="openai_compat"` — the same adapter Groq,
-  NVIDIA, Ollama, Blaxel and the self-hosted GLM endpoint all run through, making it
-  the most exercised code path in the repo.
+  the same as verified. It is now the only one: Gemini is verified through a real
+  multi-turn agent loop on `gemini-flash-latest` — tool calls, edits, file writes and
+  images — and OpenAI needs no separate verification because `openai` is
+  `kind="openai_compat"`, the same adapter Groq, NVIDIA, Ollama, Blaxel and the
+  self-hosted GLM endpoint all run through, making it the most exercised code path in
+  the repo. "Verified" here means multi-turn deliberately: a single-turn check on
+  Gemini passed while the loop was broken. See [Bugs worth reading about](#bugs-worth-reading-about).
 - **`subtle_spec_edge` currently passes for nobody** (0/5 on gpt-4o-mini). The rewrite
   overshot — runs die on collection errors and leave `NotImplementedError`, which is
   failure-to-produce-working-code, not falling for the decoy. It needs another pass.

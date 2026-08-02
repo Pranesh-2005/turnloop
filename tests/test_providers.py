@@ -255,6 +255,91 @@ async def test_gemini_encodes_an_image_block_as_inline_data():
 
 
 # --------------------------------------------------------------------------
+# Gemini thoughtSignature (functionCall parts need it echoed back or turn two
+# of any tool conversation 400s — see turnloop/providers/gemini.py module docstring)
+# --------------------------------------------------------------------------
+
+
+def gemini_provider() -> GeminiProvider:
+    return GeminiProvider(
+        name="gemini", model="gemini-flash-latest", caps=Capabilities(), api_key="k",
+    )
+
+
+def test_a_function_call_part_with_a_thought_signature_round_trips():
+    from turnloop.providers.gemini import _Accumulator
+
+    acc = _Accumulator()
+    acc.feed(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {"name": "Read", "args": {"file_path": "a"}},
+                                "thoughtSignature": "sig123",
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    done = acc.finish("gemini", "gemini-flash-latest")
+    call = done.message.tool_uses[0]
+    assert call.signature == "sig123"
+
+    contents = gemini_provider().to_wire_contents([done.message])
+    assert contents[0]["parts"][0]["thoughtSignature"] == "sig123"
+
+
+def test_a_tool_call_without_a_signature_encodes_with_no_thought_signature_key():
+    history = [
+        Message(role="assistant", content=[ToolUseBlock(id="c1", name="Read", args={"file_path": "a"})])
+    ]
+    contents = gemini_provider().to_wire_contents(history)
+    assert "thoughtSignature" not in contents[0]["parts"][0]
+
+
+def test_thought_signature_survives_a_session_jsonl_round_trip(tmp_path):
+    from turnloop.sessions.models import Session
+    from turnloop.sessions.store import SessionStore
+
+    session = Session(session_id="s1")
+    store = SessionStore.attach(session, tmp_path)
+    msg = Message(
+        role="assistant",
+        content=[ToolUseBlock(id="c1", name="Read", args={"file_path": "a"}, signature="sig123")],
+    )
+    store.write_message(msg)
+    store.close()
+
+    resumed = SessionStore.resume(tmp_path, "s1")
+    assert resumed is not None
+    assert resumed.messages[0].tool_uses[0].signature == "sig123"
+
+
+async def test_a_thought_signature_is_invisible_to_non_gemini_adapters():
+    signed = ToolUseBlock(id="c1", name="Read", args={"file_path": "a"}, signature="sig123")
+    unsigned = ToolUseBlock(id="c1", name="Read", args={"file_path": "a"})
+
+    anthro = anthropic_provider()
+    wire_signed = anthro.to_wire_messages([Message(role="assistant", content=[signed])])
+    wire_unsigned = anthro.to_wire_messages([Message(role="assistant", content=[unsigned])])
+    assert wire_signed == wire_unsigned
+
+    glm = glm_provider()
+    wire_signed = glm.to_wire_messages(
+        CompletionRequest(messages=[Message(role="assistant", content=[signed])])
+    )
+    wire_unsigned = glm.to_wire_messages(
+        CompletionRequest(messages=[Message(role="assistant", content=[unsigned])])
+    )
+    assert wire_signed == wire_unsigned
+
+
+# --------------------------------------------------------------------------
 # Anthropic
 # --------------------------------------------------------------------------
 
