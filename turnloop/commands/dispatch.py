@@ -28,14 +28,17 @@ BUILTINS = {
     "model": "show or change the model",
     "provider": "switch provider",
     "permissions": "show permission rules and mode",
+    "config": "open the settings editor",
     "plan": "switch to plan mode (read-only)",
     "auto": "switch to auto mode (no prompts)",
     "default": "switch back to default permissions",
     "memory": "show discovered memory files",
     "tools": "list available tools",
-    "mcp": "show MCP server status",
+    "skills": "list available skills",
+    "mcp": "show MCP server status ('/mcp add' opens the add-server form)",
     "hooks": "show configured hooks",
     "sessions": "list recorded sessions",
+    "resume": "browse and resume a previous session",
     "export": "write the transcript to a markdown file",
     "doctor": "run diagnostics",
     "quit": "exit",
@@ -54,6 +57,18 @@ class CommandOutcome:
     clear: bool = False
     quit: bool = False
     mode: PermissionMode | None = None
+    # "config", "mcp_add" or "resume" — tells the app which settings screen to push.
+    # This is the *only* way a settings write reaches the running TUI: the
+    # screen itself calls turnloop.configio, dispatch_command never does.
+    # Safe because dispatch_command has exactly one caller
+    # (tui/app.py's on_input_submitted -> _handle_command), which is the
+    # human's Input widget. Model output never routes through here — the
+    # agent emits tool calls, not typed slash commands — so this does not
+    # reopen the self-escalation hole the Write/Edit deny rules on
+    # `.turnloop/settings*.json` close (config.py's DEFAULT_DENY). If a future
+    # refactor ever lets model output reach dispatch_command, that assumption
+    # breaks silently — this comment is the warning.
+    open_screen: str | None = None
 
 
 async def dispatch_command(text: str, agent, settings: Settings, cwd: Path) -> CommandOutcome:
@@ -339,7 +354,47 @@ async def _tools(_args, agent, settings, cwd) -> CommandOutcome:
     return CommandOutcome(message=f"{len(agent.registry)} tools:\n" + "\n".join(lines))
 
 
-async def _mcp(_args, agent, settings, cwd) -> CommandOutcome:
+async def _skills(_args, agent, settings, cwd) -> CommandOutcome:
+    from turnloop.commands.loader import rejected_skills
+
+    tool = agent.registry.get("Skill")
+    skills = tool.skills if tool is not None else {}
+    # Loaded from disk again here rather than threaded through the Skill tool,
+    # so a malformed skill shows up even though it never made it into the
+    # registry -- "it's rejected" is the whole point being reported.
+    rejected = rejected_skills(settings.project_root)
+
+    if not skills and not rejected:
+        return CommandOutcome(
+            message=(
+                "no skills configured. Add one at ~/.turnloop/skills/<name>/SKILL.md "
+                "or <project>/.turnloop/skills/<name>/SKILL.md"
+            )
+        )
+    lines = []
+    for skill in sorted(skills.values(), key=lambda s: s.name):
+        description = skill.description if len(skill.description) <= 80 else skill.description[:77] + "..."
+        lines.append(f"  {skill.name:<18} {description}")
+    for rej in sorted(rejected, key=lambda r: str(r.path)):
+        lines.append(f"  found at {rej.path}, ignored: {rej.reason}")
+
+    header = f"{len(skills)} skills"
+    if rejected:
+        header += f", {len(rejected)} ignored"
+    return CommandOutcome(message=f"{header}:\n" + "\n".join(lines))
+
+
+async def _config(_args, agent, settings, cwd) -> CommandOutcome:
+    return CommandOutcome(open_screen="config")
+
+
+async def _resume(_args, agent, settings, cwd) -> CommandOutcome:
+    return CommandOutcome(open_screen="resume")
+
+
+async def _mcp(args, agent, settings, cwd) -> CommandOutcome:
+    if args.strip() == "add":
+        return CommandOutcome(open_screen="mcp_add")
     if not settings.mcp_servers:
         return CommandOutcome(message="no MCP servers configured")
     lines = []
@@ -413,6 +468,7 @@ _BUILTIN_HANDLERS = {
     "cost": _cost,
     "context": _context,
     "permissions": _permissions,
+    "config": _config,
     "plan": _plan,
     "auto": _auto,
     "default": _default_mode,
@@ -420,9 +476,11 @@ _BUILTIN_HANDLERS = {
     "provider": _provider,
     "memory": _memory,
     "tools": _tools,
+    "skills": _skills,
     "mcp": _mcp,
     "hooks": _hooks,
     "sessions": _sessions,
+    "resume": _resume,
     "export": _export,
     "doctor": _doctor,
 }

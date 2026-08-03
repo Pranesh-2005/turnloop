@@ -93,6 +93,29 @@ independent pieces of work that can run in parallel.
 items complete as you finish them rather than in a batch at the end.
 """
 
+CONFIG_LAYOUT = """\
+turnloop's own configuration (reference only — these files are edited by the \
+user via the `/config` and `/mcp add` slash commands in a session, or \
+`turnloop config --edit` and `turnloop mcp` from the shell; Write/Edit on them \
+is denied by design, so propose the change instead of attempting it):
+
+- Settings: `~/.turnloop/settings.json` (user), `<project root>/.turnloop/\
+settings.json` (project), `.../settings.local.json` (gitignored, secrets). \
+Later wins: user < project < local < env vars < CLI flags.
+- MCP servers: `mcp_servers.<name>` in one of those files, e.g. `{"command": \
+"...", "args": [...], "env": {...}}` for stdio, or `{"transport": "sse", "url": \
+"..."}` for sse. Entries with `env` values belong only in settings.local.json.
+- Commands: `.turnloop/commands/**.md` under the project root or `~`; needs a \
+`description` in frontmatter. Nested dirs namespace it: `git/sync.md` -> `/git:sync`.
+- Skills: `.turnloop/skills/<name>/SKILL.md` under the project root or `~`. \
+Frontmatter is YAML, not markdown, and needs `description` or it is dropped \
+(`/skills` reports why):
+  ---
+  name: my-skill
+  description: one line the model uses to decide when to load this
+  ---
+"""
+
 PLAN_MODE = """\
 You are in plan mode. Every tool that modifies anything is unavailable: no Write, \
 no Edit, no state-changing shell command. Read, search and investigate as much as \
@@ -136,6 +159,14 @@ def build_system(
 
     if len(registry) > 1 and variant != "minimal":
         segments.append(TOOL_GUIDANCE.strip())
+
+    # Reference material, not instructions to act — the model needs to know
+    # turnloop's own file layout to propose the right change (add an MCP server,
+    # point at where a skill belongs), not to attempt writing it itself. Skipped
+    # in "minimal" for the same reason TOOL_GUIDANCE is: it is prompt-driven
+    # competence, and the minimal variant exists to measure what is left without it.
+    if variant != "minimal":
+        segments.append(CONFIG_LAYOUT.strip())
 
     # Models with no reasoning mechanism benefit from being told to reason in
     # text; models with one are hurt by it, because it duplicates the thinking.

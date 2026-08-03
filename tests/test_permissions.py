@@ -167,6 +167,54 @@ def test_suggested_rule_is_narrow_not_a_blanket_grant():
 
 
 # --------------------------------------------------------------------------
+# headless decline hint (empty suggested_rule, e.g. AskUserQuestion)
+# --------------------------------------------------------------------------
+
+
+async def test_headless_decline_omits_hint_for_empty_suggested_rule(capsys):
+    from turnloop.agent.headless import PrintChannel
+    from turnloop.permissions.engine import PermissionRequest
+
+    channel = PrintChannel()
+    request = PermissionRequest(
+        tool_name="AskUserQuestion",
+        target="Playwright MCP setup",
+        summary="Would you like to add the Playwright MCP server configuration manually?",
+        args_preview="",
+        is_read_only=True,
+        suggested_rule="",
+        reason="choice",
+    )
+    decision = await channel.ask(request)
+
+    assert decision.approved is False
+    stderr = capsys.readouterr().err
+    assert "permissions.allow" not in stderr
+    assert '[""]' not in stderr
+
+
+async def test_headless_decline_still_hints_for_a_normal_tool(capsys):
+    from turnloop.agent.headless import PrintChannel
+    from turnloop.permissions.engine import PermissionRequest
+
+    channel = PrintChannel()
+    request = PermissionRequest(
+        tool_name="Write",
+        target=".turnloop/turnloop.config.json",
+        summary="Write .turnloop/turnloop.config.json",
+        args_preview="",
+        is_read_only=False,
+        suggested_rule='Write(.turnloop/**)',
+        reason="",
+    )
+    decision = await channel.ask(request)
+
+    assert decision.approved is False
+    stderr = capsys.readouterr().err
+    assert 'permissions.allow += ["Write(.turnloop/**)"]' in stderr
+
+
+# --------------------------------------------------------------------------
 # bash classification
 # --------------------------------------------------------------------------
 

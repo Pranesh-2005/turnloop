@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -9,8 +10,15 @@ from turnloop.config import find_project_root, load_settings
 from turnloop.errors import ConfigError
 
 
-def test_defaults_ship_a_working_provider(tmp_path):
-    settings = load_settings(tmp_path)
+def test_defaults_ship_a_working_provider(monkeypatch):
+    # Route through a path that doesn't exist on disk, and a fake home to
+    # match: the "user" layer in load_settings reads ~/.turnloop/settings.json
+    # unconditionally, and a dev machine's real global config (or a real
+    # ~/.turnloop up tmp_path's real ancestry) would otherwise leak into this
+    # test's result.
+    fake_root = Path("Z:/turnloop-fake-home/project")
+    monkeypatch.setattr("turnloop.config.Path.home", lambda: fake_root.parent)
+    settings = load_settings(fake_root)
     assert settings.provider == "mock"
     assert "glm" in settings.providers
 
@@ -128,11 +136,56 @@ def test_project_root_prefers_nearest_manifest_over_a_distant_git_repo(tmp_path)
 def test_explicit_turnloop_dir_wins(tmp_path):
     root = tmp_path / "root"
     (root / ".turnloop").mkdir(parents=True)
+    (root / ".turnloop" / "settings.json").write_text("{}", encoding="utf-8")
     nested = root / "a" / "b"
     nested.mkdir(parents=True)
     (nested / "pyproject.toml").write_text("", encoding="utf-8")
 
     assert find_project_root(nested) == root
+
+
+def test_auto_created_turnloop_dir_does_not_annex_a_nested_project(tmp_path):
+    """`default_project_dir` (sessions/store.py) creates `.turnloop/` with only
+    a `sessions/` folder and a `.gitignore` on every launch, unconditionally.
+    That auto-created directory must not be mistaken for a human declaration —
+    a project with its own manifest nested underneath it must resolve to
+    itself, not to the ancestor that merely happened to run turnloop once.
+    """
+    outer = tmp_path / "outer"
+    turnloop_dir = outer / ".turnloop"
+    turnloop_dir.mkdir(parents=True)
+    (turnloop_dir / "sessions").mkdir()
+    (turnloop_dir / ".gitignore").write_text("sessions/\n", encoding="utf-8")
+
+    inner = outer / "proj"
+    inner.mkdir()
+    (inner / "pyproject.toml").write_text("", encoding="utf-8")
+
+    assert find_project_root(inner) == inner
+
+
+def test_turnloop_dir_in_home_does_not_annex_unrelated_projects(monkeypatch):
+    """`~/.turnloop` is user-scope config, not a project declaration; it must
+    not make every project under home resolve its root to home itself.
+
+    Built on a path that never touches real disk (a drive letter that doesn't
+    exist) rather than `tmp_path`, because on this machine — and potentially
+    any dev machine — pytest's temp dir lives under the real home directory,
+    which itself has a real `.turnloop`. That real marker would confound the
+    test regardless of whether the fix works, so the condition is constructed
+    explicitly instead of relying on ambient machine state.
+    """
+    fake_home = Path("Z:/turnloop-fake-home")
+    project = fake_home / "code" / "myproject"
+    real_is_dir = Path.is_dir
+
+    def fake_is_dir(self):
+        return self == fake_home / ".turnloop" or real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+    monkeypatch.setattr("turnloop.config.Path.home", lambda: fake_home)
+
+    assert find_project_root(project) == project
 
 
 def test_dotenv_is_loaded_and_reports_names_only(tmp_path, monkeypatch):

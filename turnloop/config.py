@@ -266,6 +266,13 @@ DEFAULT_DENY = [
     "Read(**/.env.*)",
     "Read(**/id_rsa*)",
     "Read(**/*.pem)",
+    # settings.json / settings.local.json set permission_mode and
+    # permissions.allow. A model able to Write or Edit them could grant itself
+    # bypass mode (or wipe the deny list) on the *next* launch — this closes
+    # that self-escalation path. The glob matches both filenames: `settings*`
+    # covers `settings.json` and `settings.local.json` alike.
+    "Write(**/.turnloop/settings*.json)",
+    "Edit(**/.turnloop/settings*.json)",
 ]
 
 
@@ -292,19 +299,53 @@ _PROJECT_MARKERS = (
 )
 
 
+_TURNLOOP_DECLARATIONS = (
+    "settings.json",
+    "settings.local.json",
+    "commands",
+    "skills",
+    "TURNLOOP.md",
+)
+
+
+def _is_declared(turnloop_dir: Path) -> bool:
+    """True if a human put something in `.turnloop`, not just the tool.
+
+    `default_project_dir` (sessions/store.py) creates `.turnloop/` with a
+    `sessions/` folder and a `.gitignore` on every launch, unconditionally, in
+    whatever directory turnloop happens to start in. So the directory's mere
+    existence declares nothing — it is frequently just an artifact of having
+    once run the tool there. Only files a person actually authored (settings,
+    commands, skills, a TURNLOOP.md) count as a real declaration.
+    """
+    return any((turnloop_dir / name).exists() for name in _TURNLOOP_DECLARATIONS)
+
+
 def find_project_root(start: Path) -> Path:
     """Nearest ancestor that looks like a project root.
 
-    Two-pass on purpose. `.turnloop` is an explicit declaration and always wins.
-    Otherwise the *nearest* build-manifest-or-repo marker wins, with `.git` last
-    in the tuple — a drive root can itself be a git repository (F:\\ is one on
-    the author's machine), and keying only on `.git` would make every project's
-    root the entire drive, which then scopes permissions and sessions wrongly.
+    Two-pass on purpose. A `.turnloop` directory wins *only* if it contains an
+    explicit declaration (see `_is_declared`) — an auto-created `.turnloop`
+    holding nothing but `sessions/` must not annex whatever project happens to
+    sit beneath it. Otherwise the *nearest* build-manifest-or-repo marker wins,
+    with `.git` last in the tuple — a drive root can itself be a git repository
+    (F:\\ is one on the author's machine), and keying only on `.git` would make
+    every project's root the entire drive, which then scopes permissions and
+    sessions wrongly.
+
+    The `.turnloop` pass skips the home directory itself: `~/.turnloop` is the
+    documented user-scope settings dir (see `user_settings_path`), not a project
+    declaration, so it must not make every home-rooted path resolve to home. A
+    `.git` or manifest sitting directly in home is a real, separate signal and
+    is left alone in the marker pass below.
     """
     start = start.resolve()
+    home = Path.home().resolve()
     for candidate in (start, *start.parents):
-        if (candidate / ".turnloop").is_dir():
-            return candidate
+        if candidate != home:
+            turnloop_dir = candidate / ".turnloop"
+            if turnloop_dir.is_dir() and _is_declared(turnloop_dir):
+                return candidate
     for candidate in (start, *start.parents):
         for marker in _PROJECT_MARKERS:
             if (candidate / marker).exists():

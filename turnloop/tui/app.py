@@ -55,7 +55,7 @@ class TurnloopApp(App):
     TITLE = "turnloop"
 
     BINDINGS = [
-        Binding("ctrl+c", "interrupt", "Interrupt", priority=True),
+        Binding("ctrl+c", "interrupt", "Copy / Interrupt", priority=True),
         Binding("ctrl+d", "quit", "Quit", priority=True),
         # priority=True is required: the focused Input claims these keys otherwise,
         # and the prompt always has focus.
@@ -68,10 +68,15 @@ class TurnloopApp(App):
         self.settings = settings
         self.cwd = cwd
         self.resume_id = resume
+        # "__pick__" is bare `--resume`'s sentinel (see cli.py): a picker, not
+        # an id `SessionStore.resume` could ever look up, so the agent starts
+        # fresh here and `_open_picker_at_startup` swaps it in after mount.
+        self._pending_picker = resume == "__pick__"
         self.exit_code = 0
 
         self.channel, self._events, self._permissions = StreamChannel.create()
-        self.agent = create_agent(settings, cwd, self.channel, resume=resume)
+        effective_resume = None if self._pending_picker else resume
+        self.agent = create_agent(settings, cwd, self.channel, resume=effective_resume)
         self._queued: list[str] = []
         self._busy = False
         self._agent_worker: Worker | None = None
@@ -105,7 +110,7 @@ class TurnloopApp(App):
             f"{self.cwd}"
         )
         self.call_later(transcript.add_note, banner)
-        if self.resume_id and self.agent.session.messages:
+        if self.resume_id and not self._pending_picker and self.agent.session.messages:
             self.call_later(
                 transcript.add_note,
                 f"resumed {self.agent.session.session_id} "
@@ -118,6 +123,9 @@ class TurnloopApp(App):
                 "wall clock; the first request may cold-boot for ~29 minutes",
             )
         self.query_one(Input).focus()
+
+        if self._pending_picker:
+            self._open_picker_at_startup()
 
     # --- input ------------------------------------------------------------
 
@@ -253,20 +261,20 @@ class TurnloopApp(App):
 
         Local rather than shared: a permission the user granted on their machine is
         not automatically one their teammates want committed.
+
+        Delegates to `turnloop.configio`, the single reader/merger/atomic-writer
+        for every `.turnloop/settings*.json` file — this used to have its own
+        ad hoc JSON read-modify-write here, which is exactly the "two writers"
+        situation that makes atomic writes and minimal diffs unreliable.
         """
-        import json
+        from turnloop.configio import append_allow_rule
+        from turnloop.errors import ConfigError
 
         path = self.settings.project_root / ".turnloop" / "settings.local.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        except json.JSONDecodeError:
-            data = {}
-        permissions = data.setdefault("permissions", {})
-        allow = permissions.setdefault("allow", [])
-        if rule not in allow:
-            allow.append(rule)
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            append_allow_rule(path, rule, self.settings.project_root)
+        except ConfigError:
+            pass  # a pre-existing malformed file must not crash a running turn
 
     # --- commands ---------------------------------------------------------
 
@@ -294,15 +302,195 @@ class TurnloopApp(App):
                 self._queued.append(outcome.prompt)
             else:
                 self._start_turn(outcome.prompt)
+        if outcome.open_screen == "config":
+            # Fire-and-forget: `_open_config_screen` is a `@work`-decorated
+            # method, so calling it returns a Worker (not a coroutine) and
+            # runs the body — including its `push_screen_wait` — inside real
+            # worker context. Everything the result needs (the transcript
+            # note, applying the patch) already happens inside that worker;
+            # `_handle_command` itself has nothing left to do afterwards, so
+            # there is nothing here worth `.wait()`-ing on.
+            self._open_config_screen()
+        elif outcome.open_screen == "mcp_add":
+            self._open_mcp_add_screen()
+        elif outcome.open_screen == "resume":
+            self._open_resume_screen()
+
+    # --- settings screens ---------------------------------------------------
+    #
+    # Reached only from `_handle_command`, which is reached only from the
+    # human's Input widget (see CommandOutcome.open_screen's docstring for the
+    # full argument). Nothing here is importable from a tool.
+    #
+    # Both are `@work`-decorated for the same reason `_permission_worker`
+    # (above) is: `push_screen_wait` blocks the calling coroutine while
+    # keeping the event loop alive, which requires running inside a Textual
+    # worker or it deadlocks the very message pump it is waiting on
+    # (`NoActiveWorker`). `_handle_command` runs directly on that pump, so it
+    # cannot call `push_screen_wait` itself — it has to hand the work to one
+    # of these instead.
+
+    @work(exclusive=False, thread=False, name="config-screen")
+    async def _open_config_screen(self) -> None:
+        from turnloop.tui.config_screen import ConfigScreen
+
+        transcript = self.query_one(Transcript)
+        result = await self.push_screen_wait(ConfigScreen(self.settings))
+        if result is None:
+            return
+        path, patch = result
+        restart_for = self._apply_settings_patch(patch)
+        message = f"saved to {path}"
+        if restart_for:
+            message += f" — restart turnloop to apply: {', '.join(restart_for)}"
+        await transcript.add_note(message)
+
+    @work(exclusive=False, thread=False, name="mcp-add-screen")
+    async def _open_mcp_add_screen(self) -> None:
+        from turnloop.config import MCPServerConfig
+        from turnloop.configio import local_settings_path, write_mcp_server
+        from turnloop.errors import ConfigError
+        from turnloop.tui.mcp_screen import ServerFormModal
+
+        transcript = self.query_one(Transcript)
+        result = await self.push_screen_wait(ServerFormModal("", None))
+        if result is None:
+            return
+        # Always local: the same "not automatically something teammates want
+        # committed" reasoning as _persist_rule, and simpler than also asking
+        # for a target here — use `turnloop mcp` for the user-level file.
+        path = local_settings_path(self.settings.project_root)
+        try:
+            write_mcp_server(path, self.settings.project_root, result["name"], result["server"])
+        except ConfigError as exc:
+            await transcript.add_note(f"mcp add failed: {exc}")
+            return
+        self.settings.mcp_servers[result["name"]] = MCPServerConfig.model_validate(result["server"])
+        await transcript.add_note(
+            f"saved {result['name']} to {path} — restart turnloop to connect it"
+        )
+
+    @work(exclusive=False, thread=False, name="resume-screen")
+    async def _open_resume_screen(self) -> None:
+        """`/resume`'s call site. Same `push_screen_wait`-needs-a-worker reasoning
+        as `_open_config_screen` above — `_handle_command` runs on the message
+        pump and would deadlock it otherwise."""
+        from turnloop.tui.session_screen import SessionPickerScreen
+
+        transcript = self.query_one(Transcript)
+        session_id = await self.push_screen_wait(SessionPickerScreen(self.settings.project_root))
+        if session_id is None:
+            return
+        await transcript.add_note(await self._swap_session(session_id))
+
+    @work(exclusive=False, thread=False, name="resume-startup")
+    async def _open_picker_at_startup(self) -> None:
+        """Bare `--resume`'s call site. `on_mount` also runs on the message
+        pump, so this needs the same `@work` wrapping as `_open_resume_screen`
+        — a second, independent site for the identical `NoActiveWorker` trap,
+        not just the in-session command path."""
+        from turnloop.tui.session_screen import SessionPickerScreen
+
+        transcript = self.query_one(Transcript)
+        session_id = await self.push_screen_wait(SessionPickerScreen(self.settings.project_root))
+        if session_id is None:
+            await transcript.add_note("resume cancelled — starting a new session")
+            return
+        await transcript.add_note(await self._swap_session(session_id))
+
+    async def _swap_session(self, session_id: str) -> str:
+        """Rebuild the agent in place for `session_id`. Returns the transcript note.
+
+        Guarded on `_busy`: `aclose()` tears down the provider stream and any
+        MCP connections a live turn is using, so swapping mid-turn would corrupt
+        the turn in flight rather than let it finish. Refusing outright is the
+        same call `action_interrupt`'s ctrl+c already makes — the user retries
+        once the current turn is done, instead of the app half-rebuilding under it.
+        """
+        if self._busy:
+            return "cannot resume while a turn is running — wait for it to finish, or ctrl+c to interrupt"
+
+        await self.agent.aclose()
+        self.agent = create_agent(self.settings, self.cwd, self.channel, resume=session_id)
+        await self.agent.start()  # reconnect MCP, fire SessionStart — same as the initial boot
+
+        status = self.query_one(StatusBar)
+        status.provider = self.agent.provider.name
+        status.model = self.agent.provider.model
+        status.cost_per_hour = self.agent.provider.caps.cost_per_hour
+        status.context_max = self.agent.provider.caps.max_context
+        status.context_tokens = 0
+        status.cost_usd = 0.0
+        status.tokens_in = 0
+        status.tokens_out = 0
+        status.gpu_seconds = 0.0
+        self._queued.clear()
+
+        # ponytail: reset the view rather than re-rendering the resumed
+        # history's tool calls/thinking blocks through Transcript's live-turn
+        # widgets — replaying old messages through machinery built for a
+        # streaming turn is real added surface for what a message count plus
+        # `/export` already covers. Upgrade to a real replay if operators keep
+        # asking "what did we say" after resuming.
+        await self.query_one(Transcript).remove_children()
+        return f"resumed {self.agent.session.session_id} ({len(self.agent.session.messages)} messages)"
+
+    def _apply_settings_patch(self, patch: dict) -> list[str]:
+        """Apply the cheap-and-safe part of a saved settings patch live; name the rest.
+
+        `self.settings` is the exact object `AgentLoop` reads on every turn (see
+        `agent/factory.py`), so mutating `max_iterations` / `tool_verbosity` here
+        is enough on its own — no other object caches a copy. `permission_mode`
+        and the allow/deny/ask lists need the live `PermissionEngine` updated
+        too, the same two-line pattern `action_cycle_mode` already uses for mode.
+
+        `provider`, `providers`, `search` and `include_memory` are all baked
+        into objects built once at agent construction (the provider client, the
+        search tool, the system prompt) — reloading those live would mean
+        rebuilding the agent mid-session, which is a bigger and riskier change
+        than this screen should make silently. They are named in the returned
+        list instead, so the confirmation message says "restart to apply"
+        rather than lying about what just took effect.
+        """
+        from turnloop.permissions.rules import parse_rules
+
+        if "permission_mode" in patch:
+            mode = patch["permission_mode"]
+            self.settings.permission_mode = mode
+            self.agent.permissions.mode = mode
+            self.query_one(StatusBar).mode = mode
+        if "permissions" in patch:
+            perm = patch["permissions"]
+            for key in ("allow", "deny", "ask"):
+                if key in perm:
+                    setattr(self.settings.permissions, key, perm[key])
+                    setattr(self.agent.permissions, key, parse_rules(perm[key]))
+        if "max_iterations" in patch:
+            self.settings.max_iterations = patch["max_iterations"]
+        if "tool_verbosity" in patch:
+            self.settings.tool_verbosity = patch["tool_verbosity"]
+
+        return [key for key in ("provider", "providers", "search", "include_memory") if key in patch]
 
     # --- actions ----------------------------------------------------------
 
     def action_interrupt(self) -> None:
+        # priority=True on this binding means it runs before Screen's own
+        # ctrl+c ("copy_text") and the focused Input's ctrl+c ("copy") — both
+        # of which the focused prompt (see the BINDINGS comment above) would
+        # otherwise swallow the keypress before either ever saw it. So a
+        # selection has to be checked and copied here, by hand, or selecting
+        # text in the transcript would have no way to reach the clipboard.
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
+            self.screen.clear_selection()
+            self.call_later(self.query_one(Transcript).add_note, "copied selection to clipboard")
+            return
         if self._agent_worker is not None and self._busy:
             self._agent_worker.cancel()
             self._busy = False
-        else:
-            self.exit()
+        # Idle ctrl+c with nothing selected is a no-op: ctrl+d quits.
 
     def action_cycle_mode(self) -> None:
         order = ["default", "plan", "auto", "bypass"]

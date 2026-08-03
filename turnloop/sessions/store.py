@@ -183,6 +183,24 @@ class SessionStore:
             if not path.is_file():
                 return None
 
+        session = cls._replay(path)
+        store = cls(path, session)
+        session.store = store
+        return session
+
+    @classmethod
+    def peek(cls, path: Path) -> Session:
+        """Same replay as `resume`, minus attaching a store.
+
+        `resume` deliberately appends a fresh `meta` record on open — right for
+        actually continuing a conversation, wrong for a session picker just
+        showing a preview while the cursor moves past it. This is the read-only
+        half, used by `tui/session_screen.py`.
+        """
+        return cls._replay(path)
+
+    @classmethod
+    def _replay(cls, path: Path) -> Session:
         session = Session(session_id=path.stem)
         messages: list[Message] = []
         todos: list[Todo] = []
@@ -229,9 +247,6 @@ class SessionStore:
         session.todos = todos
         session.cost = cost
         session.turn = sum(1 for m in messages if m.role == "user")
-
-        store = cls(path, session)
-        session.store = store
         return session
 
 

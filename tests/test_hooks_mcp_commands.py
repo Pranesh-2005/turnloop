@@ -337,6 +337,58 @@ async def test_allowed_shell_expansion_runs(settings, project):
     assert "from-a-command" in (outcome.prompt or "")
 
 
+async def test_slash_config_opens_the_settings_screen(settings, project):
+    """`/config` must not write anything itself — it only tells the app which
+    screen to push. See CommandOutcome.open_screen's docstring for why that
+    split keeps this human-only."""
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/config", agent, settings, project)
+    assert outcome.open_screen == "config"
+    assert not outcome.message
+    assert not (project / ".turnloop" / "settings.local.json").exists()
+
+
+async def test_slash_mcp_add_opens_the_add_server_form(settings, project):
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/mcp add", agent, settings, project)
+    assert outcome.open_screen == "mcp_add"
+
+
+async def test_bare_slash_mcp_still_returns_status_text(settings, project):
+    """Gap 2 explicitly keeps this path untouched and read-only."""
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.config import MCPServerConfig
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    settings.mcp_servers = {"echo": MCPServerConfig(transport="stdio", command="node")}
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/mcp", agent, settings, project)
+    assert outcome.open_screen is None
+    assert "echo" in outcome.message
+    assert "stdio" in outcome.message
+
+
 # --------------------------------------------------------------------------
 # skills
 # --------------------------------------------------------------------------
@@ -377,3 +429,109 @@ async def test_the_skill_tool_loads_the_body_on_demand(project, settings, ctx):
 
     missing = await tool.run(SkillArgs(skill="nope"), ctx)
     assert missing.is_error and "deploy" in missing.content
+
+
+async def test_slash_skills_lists_name_and_description(settings, project):
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    skill_dir = project / ".turnloop" / "skills" / "deploy"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: deploy\ndescription: How this project deploys.\n---\nBody.\n",
+        encoding="utf-8",
+    )
+
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/skills", agent, settings, project)
+    assert "deploy" in outcome.message
+    assert "How this project deploys." in outcome.message
+
+
+async def test_slash_skills_with_none_configured_names_where_to_add_them(settings, project):
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/skills", agent, settings, project)
+    assert "no skills configured" in outcome.message
+    assert ".turnloop/skills" in outcome.message
+
+
+# A real live run: a model wrote frontmatter as markdown bold instead of YAML.
+# yaml.safe_load parses this to {}, so load_skills' `if not description` skip
+# drops it -- silently, before this fix. The skill was installed at exactly the
+# right path and the user was told it worked.
+_BOLD_FRONTMATTER_SKILL = (
+    "---\n\n"
+    "**name**: designing-loops\n\n"
+    "**description**: Reference for designing agent loops.\n\n"
+    "**disable-model-invocation**: true\n"
+    "---\n"
+    "Body.\n"
+)
+
+
+def test_load_skills_drops_markdown_bold_frontmatter_but_reports_it(project):
+    from turnloop.commands.loader import load_skills, rejected_skills
+
+    skill_dir = project / ".turnloop" / "skills" / "designing-loops"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_BOLD_FRONTMATTER_SKILL, encoding="utf-8")
+
+    skills = load_skills(project)
+    assert "designing-loops" not in skills  # the skip itself is correct
+
+    rejected = rejected_skills(project)
+    assert len(rejected) == 1
+    assert rejected[0].path == skill_dir / "SKILL.md"
+    assert "description" in rejected[0].reason
+
+
+def test_load_skills_still_loads_a_well_formed_skill_alongside_a_rejected_one(project):
+    from turnloop.commands.loader import load_skills, rejected_skills
+
+    bad_dir = project / ".turnloop" / "skills" / "designing-loops"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "SKILL.md").write_text(_BOLD_FRONTMATTER_SKILL, encoding="utf-8")
+
+    good_dir = project / ".turnloop" / "skills" / "deploy"
+    good_dir.mkdir(parents=True)
+    (good_dir / "SKILL.md").write_text(
+        "---\nname: deploy\ndescription: How this project deploys.\n---\nBody.\n",
+        encoding="utf-8",
+    )
+
+    skills = load_skills(project)
+    assert set(skills) == {"deploy"}
+    assert len(rejected_skills(project)) == 1
+
+
+async def test_slash_skills_reports_the_rejected_skill_and_why(settings, project):
+    from turnloop.agent.factory import create_agent
+    from turnloop.commands.dispatch import dispatch_command
+    from turnloop.providers.mock import MockProvider
+    from turnloop.tui.bridge import NullChannel
+
+    skill_dir = project / ".turnloop" / "skills" / "designing-loops"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_BOLD_FRONTMATTER_SKILL, encoding="utf-8")
+
+    agent = create_agent(
+        settings, project, NullChannel(), persist=False,
+        provider=MockProvider(mode="scripted", script=[]),
+    )
+    outcome = await dispatch_command("/skills", agent, settings, project)
+    assert str(skill_dir / "SKILL.md") in outcome.message
+    assert "description" in outcome.message
+    assert "ignored" in outcome.message

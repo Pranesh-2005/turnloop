@@ -40,6 +40,16 @@ ERROR_TIMEOUT = "timeout"
 ERROR_CRASH = "tool_crash"
 ERROR_TOOL = "tool_error"
 
+# A model that gets blocked re-issues the identical call until told to stop —
+# measured at 233k input tokens for 10 identical DENYs, and the ASK-decline
+# path loops the same way even though its message has always said "don't
+# retry." Wording alone isn't enough, so the *second* identical attempt at a
+# call already blocked once this session is short-circuited before it touches
+# hooks, the permission engine's ASK prompt, or the UI. One free retry is kept
+# because a single denial can be transient (e.g. a race on first-use rule
+# creation); two identical denials in a row never is.
+LOOP_GUARD_THRESHOLD = 1
+
 
 @dataclass(slots=True)
 class ToolCallRecord:
@@ -58,6 +68,14 @@ class ToolRunner:
         self.hooks = hooks
         self.ui = ui
         self.records: list[ToolCallRecord] = []
+        # tool name + normalized args -> (verdict, consecutive times blocked
+        # with that verdict) this session. Keyed by verdict too, not just
+        # count: if a DENY rule is edited to ASK mid-session the situation has
+        # genuinely changed, so that gets one fresh attempt rather than
+        # inheriting the DENY streak. Cleared entirely the moment the identity
+        # is allowed or approved, so a mid-session grant (TUI modal, /config)
+        # un-poisons it instead of permanently blocking a call that is now legal.
+        self._blocked_calls: dict[str, tuple[Verdict, int]] = {}
 
     async def dispatch(self, block: ToolUseBlock, ctx: ToolContext) -> list[ContentBlock]:
         started = time.monotonic()
@@ -104,20 +122,62 @@ class ToolRunner:
                 )
 
         # --- permissions ----------------------------------------------------
+        # Identity is tool name + the validated args re-serialized by pydantic,
+        # which normalizes field order regardless of how the model wrote the
+        # JSON — so two calls that only *look* different in raw text still
+        # collide on the same key. Computed fresh from `decision` (below)
+        # rather than cached, so a rule change mid-session is picked up
+        # immediately instead of trusting a stale verdict.
+        call_id = f"{tool.name}:{args.model_dump_json()}"
+
         decision = self.permissions.check(tool, args)
+
         if decision.verdict is Verdict.DENY:
+            prev_verdict, prev_count = self._blocked_calls.get(call_id, (None, 0))
+            streak = prev_count if prev_verdict is Verdict.DENY else 0
+            if streak >= LOOP_GUARD_THRESHOLD:
+                return await self._fail(
+                    block, ctx, ERROR_DENIED,
+                    f"You already tried this exact {tool.name} call and it was denied. "
+                    "Repeating it is being blocked before reaching the permission check "
+                    "at all — retrying again will not change the outcome. Stop calling "
+                    "this tool with these arguments and tell the user what you need instead.",
+                    started, tool=tool,
+                )
+            self._blocked_calls[call_id] = (Verdict.DENY, streak + 1)
             self._log_permission(ctx, tool.name, decision.verdict.value, decision.reason)
             return await self._fail(
                 block, ctx, ERROR_DENIED,
-                f"Permission denied: {decision.reason}", started, tool=tool,
+                # A deny is permanent — it outranks allow rules and bypass mode
+                # alike, so no retry can ever succeed. Saying so matters: without
+                # it a model will re-issue the same denied call in a loop (one
+                # measured run burned 233k input tokens rewriting the same
+                # settings file ten times). The ASK-decline branch below has
+                # always carried this warning; the stronger block was missing it.
+                f"Permission denied: {decision.reason}. This rule cannot be "
+                "overridden at runtime, so retrying will fail identically. "
+                "Tell the user what change you would make and let them apply it.",
+                started, tool=tool,
             )
 
         if decision.verdict is Verdict.ASK:
+            prev_verdict, prev_count = self._blocked_calls.get(call_id, (None, 0))
+            streak = prev_count if prev_verdict is Verdict.ASK else 0
+            if streak >= LOOP_GUARD_THRESHOLD:
+                return await self._fail(
+                    block, ctx, ERROR_DENIED,
+                    f"You already asked for this exact {tool.name} call and the user "
+                    "declined it. Repeating it is being blocked before prompting them "
+                    "again — retrying will not change the outcome. Stop calling this "
+                    "tool with these arguments and ask what they would prefer.",
+                    started, tool=tool,
+                )
             answer = await self._ask(tool, args, ctx, decision.reason)
             self._log_permission(
                 ctx, tool.name, "approved" if answer.approved else "rejected", answer.reason
             )
             if not answer.approved:
+                self._blocked_calls[call_id] = (Verdict.ASK, streak + 1)
                 return await self._fail(
                     block, ctx, ERROR_DENIED,
                     "The user declined this call."
@@ -125,9 +185,11 @@ class ToolRunner:
                     + " Do not retry it; ask what they would prefer.",
                     started, tool=tool,
                 )
+            self._blocked_calls.pop(call_id, None)
             if answer.scope is not Scope.ONCE and answer.rule:
                 self.permissions.grant(answer.rule, answer.scope)
         else:
+            self._blocked_calls.pop(call_id, None)
             self._log_permission(ctx, tool.name, "allowed", decision.reason)
 
         # --- run ------------------------------------------------------------

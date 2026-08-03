@@ -95,19 +95,27 @@ class PrintChannel(UIChannel):
         if self.auto_approve:
             return PermissionDecision(approved=True, scope=Scope.ONCE)
         self.declined.append(request.summary)
+        # Some tools (e.g. AskUserQuestion) have no sensible always-allow rule —
+        # interrupting for a human decision isn't something you grant in advance.
+        # suggested_rule is "" for those; skip the hint rather than print a rule
+        # nobody could use.
+        hint = (
+            f"\n    allow it with: permissions.allow += [\"{request.suggested_rule}\"]"
+            if request.suggested_rule
+            else ""
+        )
         print(
-            f"  ✗ needs approval, declined (non-interactive): {request.summary}\n"
-            f"    allow it with: permissions.allow += [\"{request.suggested_rule}\"]",
+            f"  ✗ needs approval, declined (non-interactive): {request.summary}{hint}",
             file=sys.stderr,
         )
-        return PermissionDecision(
-            approved=False,
-            reason=(
-                "This is a non-interactive session, so nobody can approve tool calls. "
-                f"Either avoid this call or tell the user to add the rule "
-                f"{request.suggested_rule!r} to their settings."
-            ),
+        reason = "This is a non-interactive session, so nobody can approve tool calls. "
+        reason += (
+            f"Either avoid this call or tell the user to add the rule "
+            f"{request.suggested_rule!r} to their settings."
+            if request.suggested_rule
+            else "This call has no rule that can be pre-approved; avoid it instead."
         )
+        return PermissionDecision(approved=False, reason=reason)
 
 
 async def run_headless(settings: Settings, cwd: Path, prompt: str, json_mode: bool,

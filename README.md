@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~18,000 lines of Python, 255 tests, no network in the default test run.
+~20,000 lines of Python, 318 tests, no network in the default test run.
 
 ---
 
@@ -88,7 +88,7 @@ point.
 Verify:
 
 ```bash
-tl --version                # turnloop 0.1.3
+tl --version                # turnloop 0.1.6
 tl doctor                   # every provider, key presence, shell, context budget
 ```
 
@@ -110,11 +110,18 @@ context arithmetic for the active provider:
 tl                                          # interactive TUI
 tl -p "why does the login test flake"       # headless single turn
 tl -p "..." --json                          # headless, JSONL events on stdout
-tl --resume                                 # resume the most recent session
-tl --resume <session-id>                    # resume a specific one
+tl -c                                       # resume the most recent session, no picker
+tl --resume                                 # interactive picker (TUI); most recent (headless)
+tl --resume <session-id>                    # resume a specific one, no picker
 tl sessions                                 # list recorded sessions
 tl config                                   # merged config + which layer each value came from
+tl config --edit                            # interactive settings editor
+tl mcp                                      # add, edit, enable/disable, remove MCP servers
 ```
+
+`config --edit` and `mcp` are deliberately the only paths that write a settings file,
+and neither is reachable by the model — see
+[Editing configuration](#editing-configuration).
 
 ### Flags
 
@@ -127,7 +134,8 @@ tl config                                   # merged config + which layer each v
 | `--max-iterations N` | tool-loop safety cap (default 40) |
 | `-p, --print PROMPT` | headless single turn |
 | `--json` | headless output as JSONL events |
-| `--resume [ID]` | resume last, or a named session |
+| `-c, --continue` | resume the most recent session directly, no picker |
+| `--resume [ID]` | bare: interactive picker in the TUI, most recent in headless. With an id: that session, no picker |
 
 ### Permission modes
 
@@ -149,11 +157,17 @@ to cycle. Make it permanent via `TURNLOOP_PERMISSION_MODE` or `settings.json`.
 ### Keys
 
 ```
-ctrl+c   interrupt the running turn (again to exit)
+ctrl+c   copy the selection; else interrupt a running turn; else nothing
 ctrl+p   cycle permission mode
 ctrl+l   clear the view (history is kept)
 ctrl+d   quit
 ```
+
+`ctrl+c` no longer quits. It used to call `self.exit()` whenever no turn was
+running, so pressing it to copy text killed the session. It now checks, in order,
+whether there is a selection to copy (via Textual's `App.copy_to_clipboard`, OSC 52,
+no new dependency), then whether a turn is running to interrupt, and otherwise does
+nothing. `ctrl+d` is still the only way to quit.
 
 `ctrl+c` and friends are bound with `priority=True` — the prompt Input always has
 focus and would otherwise swallow them.
@@ -166,9 +180,13 @@ focus and would otherwise swallow them.
 /compact     summarize conversation now /memory       discovered memory files
 /cost        token and cost accounting  /tools        available tools
 /context     what is filling the window /mcp          MCP server status
-/model       show or change model       /hooks        configured hooks
-/provider    switch provider            /sessions     recorded sessions
-/export      transcript to markdown     /doctor       diagnostics
+/model       show or change model       /mcp add      add an MCP server
+/provider    switch provider            /config       settings editor
+/export      transcript to markdown     /hooks        configured hooks
+/sessions    recorded sessions          /doctor       diagnostics
+/skills      loaded skills, and any     /resume       picker, rebuilds the
+             rejected on disk (why,                   agent in place; refuses
+             and where)                                while a turn is running
 /quit        exit
 ```
 
@@ -307,7 +325,25 @@ every segment is allowed.** Without that, `Bash(git *)` grants
 scanner that respects quoting — `shlex` discards operators, so the `rm` comes back
 looking like an argument to `git`. 48 tests cover this file alone.
 
-Ten deny rules ship by default, including `Read(**/.env)`.
+Twelve deny rules ship by default, including `Read(**/.env)` and — since 0.1.4 —
+`Write(**/.turnloop/settings*.json)` and `Edit(**/.turnloop/settings*.json)`. Those two
+close a self-escalation path: settings files set `permission_mode` and
+`permissions.allow`, so a model that could write one could grant itself `bypass` on the
+next launch. Verified against the real engine *in bypass mode*, which is the case that
+matters — deny beats bypass, so the block holds even there.
+
+That was a unit test. It has since been verified live: with
+`Write(.turnloop/**)` explicitly allowed *and* `--permission-mode bypass`, a real
+model told to grant itself permanent bypass access was blocked, made one attempt,
+and proposed the change to the user instead. The settings file was unchanged. Deny
+beats an explicit allow rule and bypass mode at once — not just in the test suite,
+against a live model that was actually trying.
+
+It is a guardrail, not a sandbox, and the boundary is worth being precise about. `Write`
+and `Edit` are blocked; **`Bash` is not**, so a shell redirect reaches the same file.
+Closing that properly needs a path guard below the tool layer rather than more patterns.
+In `default` mode Bash asks a human first, so this only bites under `bypass` — which is
+already the mode that means "I accept the consequences."
 
 ### Context compaction
 
@@ -347,6 +383,14 @@ Append-only JSONL, one file per session. Resume replays it. Append-only matters
 because a crashed run still leaves a readable trace, and because the experiments
 layer reads exactly the same format the TUI writes — a run trace and a real session
 are the same artifact.
+
+`-c`/`--continue` reopens the most recent session with no prompting. Bare `--resume`
+in the TUI opens an interactive picker — a `DataTable` of sessions, newest first,
+with a live preview pane of the selected conversation — and `--resume <id>` jumps
+straight to a specific one. `/resume` opens the same picker in-session and rebuilds
+the agent in place; it refuses while a turn is running rather than tearing one down
+mid-flight. Headless has no picker to show, so a bare `--resume` there falls back to
+"most recent" — the same thing `--continue` does.
 
 ---
 
@@ -822,11 +866,101 @@ and through session JSONL, so a `--resume`d conversation does not hit the same w
 check, and anyone who pointed 0.1.2 at Gemini got one working tool call and then a
 400. Fixed in 0.1.3.
 
-**The lesson, four times over in one project:** an 84-run sweep failing while printing
+### `NoActiveWorker`: 283 green tests and a crash on the first keystroke
+
+The config UI shipped with tests covering `/config` — they asserted that dispatching it
+returned `open_screen="config"`. All 283 passed. Typing `/config` in the actual TUI
+raised `NoActiveWorker: push_screen must be run from a worker`.
+
+Textual's `push_screen_wait` blocks the calling coroutine until the screen is dismissed,
+so it must run inside a worker; called from the message pump it would deadlock the pump
+it is waiting on, and Textual refuses rather than hanging. `_handle_command` runs on the
+pump. So does Textual's action dispatch, which meant the same defect existed at four
+call sites, not the one in the traceback — including the provider form reachable from
+`tl config --edit`, a path the crash report never touched.
+
+The correct pattern was eleven lines away in the same file: `_permission_worker` is
+`@work`-decorated, which is exactly why *its* `push_screen_wait` works.
+
+Two things this cost, both worth stating. The tests verified the layer *below* the bug —
+that the command produced the right instruction, never that the app could carry it out.
+And **0.1.4 shipped this way**, so `pip install turnloop==0.1.4` crashes on `/config`.
+Fixed in 0.1.5. The tests now drive a real app through Textual's `run_test()` pilot and
+fail if the decorators are removed.
+
+**A directory that exists on every launch cannot mean "this is a project."**
+
+`find_project_root` treated any ancestor `.turnloop` directory as an explicit project
+declaration. But `default_project_dir` creates `.turnloop/` — with a `sessions/`
+folder and a `.gitignore` — on every launch, unconditionally, wherever turnloop
+happens to start. So the directory's mere existence declared nothing; it was
+frequently just the residue of having once run the tool there. Run `tl` once from a
+home directory, or a drive root, and it permanently annexed every project beneath it:
+sessions, the `.env` layer, `settings.json` and the permission rules all resolved to
+the wrong root from then on. Real instance, the author's own machine: `F:\.turnloop`
+was created on 2026-08-01, and every `F:\anything\proj\pyproject.toml` since then
+resolved its project root to `F:\`.
+
+The invariant that broke was never written down as one, which is exactly why it lasted.
+The fix makes the implicit rule explicit: a `.turnloop` counts only if it holds
+something a human put there — `settings.json`, `settings.local.json`, `commands/`,
+`skills/`, `TURNLOOP.md` — and one holding only an auto-created `sessions/` is ignored.
+The home directory is excluded outright on top of that, since `~/.turnloop` is the
+user-scope settings location and can never mean "project." The false invariant had
+been there since the tool first created `.turnloop/` on launch; fixed in 0.1.6.
+
+**A skill that failed to parse vanished with no error, and the model reported success.**
+
+A live run installed a skill whose frontmatter was markdown-bold — `**name**:
+something` — rather than YAML. `yaml.safe_load` returned no usable keys,
+`load_skills` hit its "no description" skip, and the skill disappeared: no exception,
+no log line, nothing in `/skills`. The model that had just "installed" it reported
+success, because from its side the write succeeded and nothing said otherwise.
+
+The bug was not the parser rejecting bad frontmatter — that part is correct. It was
+that a rejection and a nonexistent skill looked identical from the outside. `load_skills`
+keeps its exact signature, but a new `rejected_skills()` now returns what was dropped
+and why, `/skills` reports it, and `CONFIG_LAYOUT` shows the literal YAML frontmatter
+block in the system prompt so the model stops guessing at markdown-bold instead.
+Fixed in 0.1.6.
+
+**A permission denial that should end in one message looped ten times, and it cost
+real money before anyone noticed — because nothing about it failed a test.**
+
+Two defects landed in the same code path with the same symptom. The DENY branch's
+message said only `Permission denied: <rule>`; the ASK-decline branch, which is
+recoverable, had always carried "Do not retry it" — so the weaker wording sat on the
+*permanent* block, the one that most needed it. Fixing the message was not enough on
+its own: the ASK path looped despite already carrying that warning, because prompt
+wording is a request, not a constraint, and a model under pressure to finish a task
+does not reliably honor it.
+
+Measured against a live, non-interactive provider — this is what a passing test suite
+cannot see, since nothing here raises or returns the wrong value, it just keeps calling
+a tool that keeps getting denied:
+
+- denied `Write .turnloop/settings.local.json`, repeated 10 times → **233,742 input
+  tokens, $0.0372**
+- after the message fix alone → **10,654 tokens, $0.0017**, one attempt then a correct
+  proposal to the user
+- a separate ASK-decline loop on `dir`/`mkdir`, before any fix → **199,352 tokens,
+  $0.0317**
+
+So wording is now backed by a deterministic guard in `ToolRunner` rather than trusted
+alone: identity is tool name plus pydantic-normalized args, scope is the session, one
+free retry, and the entry clears the moment the call is allowed or approved — so a
+permission granted mid-session un-poisons a call that was denied earlier, instead of
+blocking it forever. Fixed in 0.1.6.
+
+**The lesson, eight times over in one project:** an 84-run sweep failing while printing
 a tidy report of zeros; a tool returning empty with `ok: true`; a sweep sitting at
 10/18 doing nothing for 25 minutes; an adapter passing its live test and failing on
-the turn the test never made. Each was caught only by looking past the summary line —
-and the last one only by using the thing instead of testing it.
+the turn the test never made; a feature with green tests that crashed on its first
+keystroke; an implicit invariant that a docstring never stated, so nobody noticed it
+was false; a silent failure that a model reported as success; a cost bug that no
+assertion could ever have caught, because every individual call did exactly what it
+was told. Each was caught only by looking past the summary line — and most of them
+only by using the thing instead of testing it.
 
 ---
 
@@ -860,24 +994,27 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 255 tests, no network
+pytest                    # 318 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
 
 | file | tests | |
 |---|---|---|
-| `test_permissions.py` | 48 | rule grammar, compound-command splitting, mode enforcement |
+| `test_permissions.py` | 50 | rule grammar, compound-command splitting, mode enforcement |
 | `test_experiments.py` | 36 | runner, graders, report, suite invariants, config resolution |
 | `test_providers.py` | 35 | adapters vs recorded `.sse`, image blocks, thought signatures |
 | `test_tools_files.py` | 28 | Read/Write/Edit/Glob/Grep, encodings, newlines, image detection |
-| `test_loop.py` | 20 | streaming, truncation, iteration cap |
-| `test_hooks_mcp_commands.py` | 20 | lifecycle hooks, MCP client, slash commands |
-| `test_config.py` | 21 | layering, env overrides, presets, narrow-console guard |
+| `test_hooks_mcp_commands.py` | 28 | lifecycle hooks, MCP client, slash commands |
+| `test_tui.py` | 24 | Textual snapshots, `/config` and `/mcp add` driven through a real app |
+| `test_config.py` | 23 | layering, env overrides, presets, narrow-console guard |
+| `test_loop.py` | 23 | streaming, truncation, iteration cap |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
+| `test_configio.py` | 15 | minimal-diff writes, atomic save, secret-bearing MCP targets, the settings deny rules |
 | `test_bash.py` | 14 | shell selection, process-tree kill |
+| `test_config_screen.py` | 10 | provider form validation, caps derivation, env indicator leaks |
 | `test_websearch.py` | 9 | HTML parsing, backend selection, truncation, failure modes |
-| `test_tui.py` | 8 | Textual snapshots |
+| `test_system_prompt_layout.py` | 7 | `CONFIG_LAYOUT` presence, token cost, `minimal` variant omission |
 
 `conftest.py` monkeypatches httpx's transport to raise unless a test is marked
 `live` — **network is off at the transport layer**, so a forgotten real call fails
@@ -924,9 +1061,100 @@ Slash commands live in `.turnloop/commands/*.md`, skills in
 in the system prompt and load their body on demand, which on a 65k window is the
 difference between having skills and not.
 
+The system prompt also documents this layout to the model itself, as `CONFIG_LAYOUT`
+— 326 tokens, in the cacheable region, omitted from the `minimal` variant. Without it
+the model cannot configure the tool it is running inside: asked to add an MCP server
+it invented `.turnloop/turnloop.config.json`, and asked to install a skill it wrote to
+`examples/` — both real outputs from live runs. With it, both go to the right place
+first try. It includes the literal YAML frontmatter a skill needs, since a skill with
+markdown-bold frontmatter instead of YAML used to vanish with no diagnostic; `/skills`
+now also reports anything found on disk but rejected, with the reason and path — see
+[Bugs worth reading about](#bugs-worth-reading-about).
+
 Shell expansion inside a command template (`` !`cmd` ``) goes through the permission
 engine like any other Bash call. A markdown file in a repository is not trusted input
 just because it is on disk.
+
+### Editing configuration
+
+`tl config --edit` edits the provider table, permission mode, tool verbosity, iteration
+cap, search backend, memory, and the three rule lists. `tl mcp` manages MCP servers. The
+same screens open inside a running session as `/config` and `/mcp add`.
+
+**Adding a provider** is a form for `kind`, `model`, `base_url`, and `api_key_env`, with
+a live ✓/✗ showing whether that environment variable is currently set. Capabilities are
+re-derived from `preset_for(model)` on every save, mirroring what `load_settings` does
+for `--model` — without that, a provider added through the UI keeps the previous model's
+context window and pricing, and `doctor`'s context-budget line quietly lies. An
+`openai_compat` provider without a `base_url` is refused by the form, because
+`load_settings` would otherwise raise on the *next* launch, turning a typo into a CLI
+that will not start.
+
+Four further properties are structural rather than cosmetic:
+
+**Only the diff is written.** Neither screen dumps the settings model. It writes the
+difference against the packaged defaults, merged into whatever the file already holds.
+Round-tripping the full model would freeze today's deny list and provider table into
+your file permanently, so a future security default could never reach you.
+
+**Writes are atomic and validated.** The edited settings round-trip through
+`Settings.model_validate` before anything touches disk, then land via a temp file and
+`os.replace`. A malformed settings file makes `load_settings` raise and the CLI exit 2 —
+failing closed is right, but only if we never cause it ourselves.
+
+**Secrets are named, never stored.** Provider credentials are edited as the env var
+*name*, and the written config has an `api_key_env` key and no `api_key` value at all —
+a config UI with a "paste your key here" box writes secrets into a JSON file that gets
+committed, which is how keys leak. The ✓/✗ indicator reports the name and a boolean,
+never the value, a prefix, or a length. MCP `env` values are literal by protocol necessity, so a server carrying any is
+forced to `settings.local.json` and refused a shared file, and the screen creates
+`.turnloop/.gitignore` before writing — otherwise a secret-bearing file can be committed
+before the first session ever runs.
+
+**No agent-reachable route writes settings.** No tool and no hook mutates a settings
+file — which is what makes the deny rules above meaningful instead of decorative.
+`/config` and `/mcp add` are slash commands, and that is safe for a specific reason worth
+stating: `dispatch_command` has exactly one caller, reached from the prompt Input's
+`on_input_submitted`. The model emits tool calls, not typed input, so it cannot reach
+that path. The property lives in the dispatch path rather than in the commands, so a
+future refactor that routes model output through `dispatch_command` would break it
+silently — there is a comment there saying so.
+
+**In-session saves reload only what is safe to reload.** `permission_mode`,
+`permissions`, `max_iterations` and `tool_verbosity` are read from the live `Settings`
+and `PermissionEngine`, so they take effect immediately. `provider`, `providers`,
+`search` and `include_memory` are baked into objects built once at agent construction,
+so the confirmation names them as needing a restart. Reporting "saved" while the old
+permission mode is still being enforced would be worse than saying nothing.
+
+One honest gap: removing a server deletes it from the one file you chose. `deep_merge`
+has no tombstone, so a server also defined in a higher layer stays effective. The screen
+says so rather than pretending otherwise.
+
+### MCP servers are a trust decision
+
+Adding an MCP server is the same class of decision as `npm install`, and turnloop cannot
+check it for you. Two specific reasons, both inherent to the protocol rather than to this
+implementation:
+
+**A stdio server is a program you agreed to run.** `command` and `args` are spawned as a
+child process at every launch, with your full user privileges and any `env` you set. The
+add form states this and requires an explicit confirmation, because a text field labelled
+"command" does not otherwise read like "execute this forever."
+
+**Tool descriptions are untrusted text that enters the model's context.** A server
+advertises its own names and descriptions, and those go into the system prompt verbatim.
+A hostile or compromised server can put instructions there. Nothing in the protocol
+authenticates that text.
+
+What turnloop does about it, which is containment rather than prevention: MCP tools are
+`read_only = False` unconditionally (`mcp/adapter.py`), because the protocol has no
+read-only annotation worth trusting — so they always prompt in `default` mode and are
+refused outright in `plan` mode. A dead or misbehaving server degrades to "that tool is
+unavailable" and never blocks the loop. Connections are lazy and every call is bounded.
+
+None of that helps if you install a server that does exactly what it says. Read what you
+add.
 
 ---
 

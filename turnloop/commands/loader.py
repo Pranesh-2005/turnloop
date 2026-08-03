@@ -71,6 +71,20 @@ class Skill:
         return f"- {self.name}: {self.description}"
 
 
+@dataclass(slots=True)
+class RejectedSkill:
+    """A SKILL.md found on disk that was not loaded, and why.
+
+    Dropping a malformed skill is correct (see `load_skills`), but doing it
+    silently means the only symptom the user sees is "the skill isn't there" --
+    which they will not connect to a frontmatter typo. This carries the reason
+    so a caller can tell them.
+    """
+
+    path: Path
+    reason: str
+
+
 def _search_dirs(project_root: Path, kind: str) -> list[tuple[Path, str]]:
     return [
         (Path.home() / ".turnloop" / kind, "user"),
@@ -105,7 +119,26 @@ def load_commands(project_root: Path) -> dict[str, UserCommand]:
 
 def load_skills(project_root: Path) -> dict[str, Skill]:
     """Load `.turnloop/skills/<name>/SKILL.md`."""
+    skills, _rejected = _load_skills(project_root)
+    return skills
+
+
+def rejected_skills(project_root: Path) -> list[RejectedSkill]:
+    """Skills found on disk but dropped, for `/skills` to report.
+
+    Separate from `load_skills` rather than a second return value there: every
+    existing caller of `load_skills` (agent construction, `doctor`) wants just
+    the usable dict, and changing that signature would ripple through code this
+    fix has no business touching. Only `/skills` needs the rejects, so it asks
+    for them directly.
+    """
+    _skills, rejected = _load_skills(project_root)
+    return rejected
+
+
+def _load_skills(project_root: Path) -> tuple[dict[str, Skill], list[RejectedSkill]]:
     skills: dict[str, Skill] = {}
+    rejected: list[RejectedSkill] = []
     for directory, _scope in _search_dirs(project_root, "skills"):
         if not directory.is_dir():
             continue
@@ -115,12 +148,16 @@ def load_skills(project_root: Path) -> dict[str, Skill]:
             description = str(fm.data.get("description", "")).strip()
             if not description:
                 # Without a description the model has no basis for choosing it, so
-                # advertising it would be pure context cost.
+                # advertising it would be pure context cost. The skip is correct;
+                # only the silence was the bug -- record why for /skills to surface.
+                rejected.append(
+                    RejectedSkill(path=skill_file, reason="no `description` in frontmatter")
+                )
                 continue
             skills[name] = Skill(
                 name=name, description=description, body=fm.body, path=skill_file
             )
-    return skills
+    return skills, rejected
 
 
 def _read(path: Path) -> str:

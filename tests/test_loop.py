@@ -244,6 +244,79 @@ async def test_declined_permission_tells_the_model_not_to_retry(ctx, permissions
     assert not (ctx.cwd / "new.txt").exists()
 
 
+async def test_loop_guard_short_circuits_a_repeated_identical_decline(ctx, permissions):
+    """A model that ignores 'do not retry' must be stopped by the harness, not just told."""
+    from turnloop.tools.builtin import build_registry
+
+    channel = NullChannel(auto_approve=False)
+    ctx = ctx.child(ask=channel.ask)
+    runner = ToolRunner(build_registry(ctx.settings, ctx.cwd), permissions)
+    block = ToolUseBlock(id="c1", name="Write", args={"file_path": "new.txt", "content": "x"})
+
+    first = (await runner.dispatch(block, ctx))[0]
+    second = (await runner.dispatch(block, ctx))[0]
+    third = (await runner.dispatch(block, ctx))[0]
+
+    assert first.is_error and "Do not retry" in first.content
+    assert second.is_error and "already asked" in second.content
+    assert third.is_error and "already asked" in third.content
+    # only the first attempt actually reached the UI; the rest were short-circuited
+    # before the permission engine's ASK prompt was ever shown.
+    assert len(channel.asked) == 1
+    assert runner.error_counts() == {ERROR_DENIED: 3}
+    assert not (ctx.cwd / "new.txt").exists()
+
+
+async def test_loop_guard_does_not_affect_a_different_call(ctx, permissions):
+    from turnloop.tools.builtin import build_registry
+
+    channel = NullChannel(auto_approve=False)
+    ctx = ctx.child(ask=channel.ask)
+    runner = ToolRunner(build_registry(ctx.settings, ctx.cwd), permissions)
+
+    await runner.dispatch(
+        ToolUseBlock(id="c1", name="Write", args={"file_path": "a.txt", "content": "x"}), ctx
+    )
+    await runner.dispatch(
+        ToolUseBlock(id="c1", name="Write", args={"file_path": "a.txt", "content": "x"}), ctx
+    )
+    other = (
+        await runner.dispatch(
+            ToolUseBlock(id="c2", name="Write", args={"file_path": "b.txt", "content": "y"}), ctx
+        )
+    )[0]
+
+    # a different target is a different identity: it still gets a real ask,
+    # not the short-circuit message left behind by a.txt's streak.
+    assert other.is_error and "already asked" not in other.content
+    assert len(channel.asked) == 2
+
+
+async def test_loop_guard_does_not_poison_a_call_that_is_later_granted(ctx, permissions):
+    """The regression that matters: approve-then-retry must still work after a block."""
+    from turnloop.permissions.engine import Scope
+    from turnloop.tools.builtin import build_registry
+
+    channel = NullChannel(auto_approve=False)
+    ctx = ctx.child(ask=channel.ask)
+    runner = ToolRunner(build_registry(ctx.settings, ctx.cwd), permissions)
+    block = ToolUseBlock(id="c1", name="Write", args={"file_path": "new.txt", "content": "x"})
+
+    await runner.dispatch(block, ctx)  # declined
+    blocked = (await runner.dispatch(block, ctx))[0]  # short-circuited
+    assert blocked.is_error and "already asked" in blocked.content
+
+    # The user grants it out-of-band (TUI "always allow", or a /config edit).
+    # `permissions.grant` is exactly what the runner itself calls when an ASK
+    # is approved with a persisted scope, so this stands in for that flow.
+    permissions.grant("Write", Scope.SESSION)
+
+    result = (await runner.dispatch(block, ctx))[0]
+
+    assert not result.is_error
+    assert (ctx.cwd / "new.txt").read_text(encoding="utf-8") == "x"
+
+
 async def test_recovery_rate_counts_a_later_success_on_the_same_tool(ctx, permissions):
     from turnloop.tools.builtin import build_registry
 

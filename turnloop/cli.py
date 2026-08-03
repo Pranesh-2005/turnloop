@@ -43,8 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"turnloop {__version__}")
     p.add_argument("-p", "--print", dest="prompt", metavar="PROMPT",
                    help="run a single headless turn and print the result")
-    p.add_argument("--resume", nargs="?", const="__last__", metavar="SESSION_ID",
-                   help="resume the last session, or a specific one")
+    p.add_argument("-c", "--continue", dest="continue_session", action="store_true",
+                   help="resume the most recent session directly, no picker")
+    p.add_argument("--resume", nargs="?", const="__pick__", metavar="SESSION_ID",
+                   help="resume a session: bare flag opens an interactive picker "
+                        "(TUI only — headless has no picker, so it falls back to "
+                        "the most recent session), or pass a session id to jump "
+                        "straight to it")
     p.add_argument("--json", action="store_true", help="headless output as JSONL events")
 
     sub = p.add_subparsers(dest="command")
@@ -54,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     cfg = sub.add_parser("config", parents=[common], help="show effective configuration")
     cfg.add_argument("--raw", action="store_true", help="dump full JSON")
+    cfg.add_argument("--edit", action="store_true",
+                     help="open the interactive settings editor (Textual)")
+
+    sub.add_parser("mcp", parents=[common],
+                   help="add, edit, enable/disable and remove MCP servers (Textual)")
 
     sess = sub.add_parser("sessions", parents=[common], help="list recorded sessions")
     sess.add_argument("-n", type=int, default=20, help="how many to show")
@@ -104,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cwd = (getattr(args, "cwd", None) or Path.cwd()).resolve()
+    # `--continue` is `--resume` with no picker, ever — resolved once here so
+    # every downstream reader (headless, TUI) sees one flag instead of two.
+    resume = "__last__" if getattr(args, "continue_session", False) else args.resume
 
     try:
         settings = load_settings(cwd, _cli_overrides(args))
@@ -115,14 +128,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return _cmd_doctor(settings, cwd)
         if args.command == "config":
+            if args.edit:
+                return _cmd_config_edit(settings)
             return _cmd_config(settings, raw=args.raw)
+        if args.command == "mcp":
+            return _cmd_mcp(settings)
         if args.command == "sessions":
             return _cmd_sessions(settings, args.n)
         if args.command == "experiment":
             return _cmd_experiment(settings, args)
         if args.prompt:
-            return _cmd_headless(settings, cwd, args)
-        return _cmd_tui(settings, cwd, args)
+            return _cmd_headless(settings, cwd, args, resume)
+        return _cmd_tui(settings, cwd, args, resume)
     except TurnloopError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -158,6 +175,29 @@ def _cmd_config(settings: Settings, raw: bool) -> int:
     return 0
 
 
+def _cmd_config_edit(settings: Settings) -> int:
+    """Launch the Textual settings editor.
+
+    This is the only entry point into `configio`'s writers besides the running
+    TUI's own permission-grant prompt (R6): no tool, slash command, or headless
+    path can reach it.
+    """
+    from turnloop.tui.config_screen import ConfigEditorApp
+
+    app = ConfigEditorApp(settings)
+    app.run()
+    if app.saved_to:
+        print(f"saved to {app.saved_to}")
+    return 0
+
+
+def _cmd_mcp(settings: Settings) -> int:
+    from turnloop.tui.mcp_screen import McpEditorApp
+
+    McpEditorApp(settings).run()
+    return 0
+
+
 def _cmd_doctor(settings: Settings, cwd: Path) -> int:
     from turnloop.diagnostics import run_doctor
 
@@ -179,20 +219,26 @@ def _cmd_sessions(settings: Settings, limit: int) -> int:
     return 0
 
 
-def _cmd_headless(settings: Settings, cwd: Path, args: argparse.Namespace) -> int:
+def _cmd_headless(settings: Settings, cwd: Path, args: argparse.Namespace,
+                  resume: str | None) -> int:
     import anyio
 
     from turnloop.agent.headless import run_headless
 
+    # A bare `--resume` has no picker to fall back to outside the TUI, so
+    # headless treats it the same as `--continue`: most recent session.
+    if resume == "__pick__":
+        resume = "__last__"
     return anyio.run(
-        run_headless, settings, cwd, args.prompt, args.json, args.resume
+        run_headless, settings, cwd, args.prompt, args.json, resume
     )
 
 
-def _cmd_tui(settings: Settings, cwd: Path, args: argparse.Namespace) -> int:
+def _cmd_tui(settings: Settings, cwd: Path, args: argparse.Namespace,
+            resume: str | None) -> int:
     from turnloop.tui.app import TurnloopApp
 
-    app = TurnloopApp(settings=settings, cwd=cwd, resume=args.resume)
+    app = TurnloopApp(settings=settings, cwd=cwd, resume=resume)
     app.run()
     return app.exit_code or 0
 
