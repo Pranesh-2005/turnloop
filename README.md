@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~20,000 lines of Python, 318 tests, no network in the default test run.
+~20,000 lines of Python, 346 tests, no network in the default test run.
 
 ---
 
@@ -88,7 +88,7 @@ point.
 Verify:
 
 ```bash
-tl --version                # turnloop 0.1.6
+tl --version                # turnloop 0.1.8
 tl doctor                   # every provider, key presence, shell, context budget
 ```
 
@@ -994,7 +994,7 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 318 tests, no network
+pytest                    # 346 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
@@ -1006,8 +1006,9 @@ mypy turnloop
 | `test_providers.py` | 35 | adapters vs recorded `.sse`, image blocks, thought signatures |
 | `test_tools_files.py` | 28 | Read/Write/Edit/Glob/Grep, encodings, newlines, image detection |
 | `test_hooks_mcp_commands.py` | 28 | lifecycle hooks, MCP client, slash commands |
-| `test_tui.py` | 24 | Textual snapshots, `/config` and `/mcp add` driven through a real app |
+| `test_tui.py` | 25 | Textual snapshots, `/config` and `/mcp add` driven through a real app |
 | `test_config.py` | 23 | layering, env overrides, presets, narrow-console guard |
+| `test_skills_install.py` | 27 | frontmatter validation, GitHub resolution, path dedupe, EOF on every prompt, drive-root refusal |
 | `test_loop.py` | 23 | streaming, truncation, iteration cap |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
 | `test_configio.py` | 15 | minimal-diff writes, atomic save, secret-bearing MCP targets, the settings deny rules |
@@ -1078,8 +1079,9 @@ just because it is on disk.
 ### Editing configuration
 
 `tl config --edit` edits the provider table, permission mode, tool verbosity, iteration
-cap, search backend, memory, and the three rule lists. `tl mcp` manages MCP servers. The
-same screens open inside a running session as `/config` and `/mcp add`.
+cap, search backend, memory, and the three rule lists. `tl mcp` manages MCP servers.
+`tl skills add/list/remove` manages skills. The config and MCP screens open inside a
+running session as `/config` and `/mcp add`.
 
 **Adding a provider** is a form for `kind`, `model`, `base_url`, and `api_key_env`, with
 a live ✓/✗ showing whether that environment variable is currently set. Capabilities are
@@ -1155,6 +1157,37 @@ unavailable" and never blocks the loop. Connections are lazy and every call is b
 
 None of that helps if you install a server that does exactly what it says. Read what you
 add.
+
+### Skills are a trust decision too
+
+`tl skills add <owner/repo>` resolves a GitHub repo shorthand, a repo URL, or a direct
+raw URL to a `SKILL.md`, and installs it to `.turnloop/skills/<name>/` (or
+`~/.turnloop/skills/` with `--user`). The same reasoning as the MCP section above
+applies without modification: a skill's body is not metadata, it is text that gets
+loaded straight into the model's context the moment the model decides the skill
+applies (`commands/loader.py`). A hostile `SKILL.md` can instruct the model exactly
+like a hostile MCP tool description can. `add` prints the source URL and the
+description and asks for confirmation before writing anything; `--yes` skips waiting
+for that confirmation but never skips printing it, and never skips printing what got
+installed and from where.
+
+Before writing, `add` parses the frontmatter with the same `parse_frontmatter` the
+loader uses and requires a non-empty `description` — the exact rule `load_skills`
+enforces when deciding what to advertise (see "A skill that failed to parse vanished
+with no error" below). A `SKILL.md` that would silently vanish once installed is
+refused before it is ever written, rather than discovered later as "the skill isn't
+there."
+
+**Importing from Claude Code.** If `~/.claude/skills/*/SKILL.md` exist and turnloop
+has never asked about them, one line appears once, in the TUI, pointing at
+`tl skills import` — not a prompt that blocks startup, and not a silent copy.
+Importing computes the token cost of each candidate with `rough_tokens` before you
+choose (34 skills advertise for about 2,961 tokens of permanent system-prompt
+overhead — most of a session's `CONFIG_LAYOUT` segment on its own), lets you import
+any subset, and copies the chosen files into turnloop's own skills directory rather
+than reading `~/.claude/skills` at runtime — turnloop stays uncoupled from another
+tool's directory layout. Whether you say yes or no, the question is recorded in the
+user-level settings file so it is never asked again.
 
 ---
 

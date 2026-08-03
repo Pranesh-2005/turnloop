@@ -65,6 +65,32 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("mcp", parents=[common],
                    help="add, edit, enable/disable and remove MCP servers (Textual)")
 
+    skl = sub.add_parser("skills", parents=[common], help="add, list and remove skills")
+    skl_sub = skl.add_subparsers(dest="skills_action", required=True)
+
+    skl_add = skl_sub.add_parser("add", help="install a skill from a repo or URL")
+    skl_add.add_argument("source", help="owner/repo, a repo URL, or a direct URL to a SKILL.md")
+    skl_add.add_argument("--user", action="store_true",
+                         help="install to ~/.turnloop/skills (default: project)")
+    skl_add.add_argument("--yes", action="store_true",
+                         help="skip the interactive confirmation (still prints the warning "
+                              "and what was installed and from where)")
+
+    skl_sub.add_parser("list", help="list installed skills")
+
+    skl_rm = skl_sub.add_parser("remove", help="remove an installed skill")
+    skl_rm.add_argument("name")
+    skl_rm.add_argument("--user", action="store_true", help="remove from ~/.turnloop/skills")
+    skl_rm.add_argument("--yes", action="store_true", help="skip the delete confirmation")
+
+    skl_imp = skl_sub.add_parser(
+        "import", help="import skills already installed for Claude Code (~/.claude/skills)"
+    )
+    skl_imp.add_argument("--user", action="store_true",
+                         help="import to ~/.turnloop/skills (default: project)")
+    skl_imp.add_argument("--all", action="store_true",
+                         help="import every candidate without prompting")
+
     sess = sub.add_parser("sessions", parents=[common], help="list recorded sessions")
     sess.add_argument("-n", type=int, default=20, help="how many to show")
 
@@ -133,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_config(settings, raw=args.raw)
         if args.command == "mcp":
             return _cmd_mcp(settings)
+        if args.command == "skills":
+            return _cmd_skills(settings, args, cwd)
         if args.command == "sessions":
             return _cmd_sessions(settings, args.n)
         if args.command == "experiment":
@@ -196,6 +224,220 @@ def _cmd_mcp(settings: Settings) -> int:
 
     McpEditorApp(settings).run()
     return 0
+
+
+def _cmd_skills(settings: Settings, args: argparse.Namespace, cwd: Path) -> int:
+    if args.skills_action == "add":
+        return _cmd_skills_add(settings, args, cwd)
+    if args.skills_action == "list":
+        return _cmd_skills_list(settings)
+    if args.skills_action == "remove":
+        return _cmd_skills_remove(settings, args)
+    return _cmd_skills_import(settings, args, cwd)
+
+
+def _print_skill_target(settings: Settings, user_level: bool, cwd: Path) -> None:
+    """Print exactly where a project-scope install is about to write.
+
+    `settings.project_root` is resolved from `cwd` by `find_project_root`, which
+    can legitimately walk up several directories to find a marker -- so it is
+    frequently NOT `cwd` itself. That divergence is exactly what put skills at
+    `F:\\.turnloop\\skills` instead of the project the user was standing in, so
+    it must be surfaced before anything is written, not left implicit.
+    """
+    if user_level:
+        print(f"installing to {Path.home() / '.turnloop' / 'skills'}")
+        return
+    dest = settings.project_root / ".turnloop" / "skills"
+    print(f"installing to {dest}")
+    if settings.project_root != cwd:
+        print(f"note: resolved project root is {settings.project_root}, not the "
+              f"current directory ({cwd}) -- run `tl config` to see why")
+
+
+def _prompt(text: str) -> str:
+    """`input()`, but closed/piped stdin exits cleanly instead of a traceback.
+
+    Every confirmation in the skills commands goes through this. Piping stdin
+    from `/dev/null` (or any non-interactive invocation -- CI, a script) hits
+    EOF the instant `input()` reads, which is a normal thing for a CLI to face
+    and not worth a stack trace over.
+    """
+    try:
+        return input(text)
+    except EOFError:
+        print("\nskills: no input available (stdin is closed) -- rerun with --yes "
+              "for non-interactive use", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+_SKILL_TRUST_NOTICE = (
+    "Its body will be loaded into the model's context whenever the model decides "
+    "it applies -- this is the same class of trust decision as adding an MCP "
+    "server (README: 'MCP servers are a trust decision'). A skill can put "
+    "instructions in front of the model just like any other text it reads. "
+    "Read it before you agree."
+)
+
+
+def _cmd_skills_add(settings: Settings, args: argparse.Namespace, cwd: Path) -> int:
+    import anyio
+    import httpx
+
+    from turnloop.skills_install import (
+        SkillInstallError,
+        fetch_skill_sources,
+        install_skill,
+        validate_skill_content,
+    )
+
+    _print_skill_target(settings, args.user, cwd)
+
+    async def _fetch():
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await fetch_skill_sources(args.source, client)
+
+    try:
+        sources = anyio.run(_fetch)
+    except SkillInstallError as exc:
+        print(f"skills add: {exc}", file=sys.stderr)
+        return 1
+
+    if len(sources) > 1:
+        print(f"{args.source} contains {len(sources)} skills:")
+        for i, s in enumerate(sources, 1):
+            print(f"  {i}. {s.name}")
+        if args.yes:
+            # `--yes` means "don't make me answer prompts", and the collection
+            # selector is a prompt like any other -- treating it differently would
+            # mean `--yes` still hangs (now fixed to error) waiting on stdin that
+            # was never going to arrive in a script/CI invocation. "all" is also
+            # the reading that makes `--yes` actually do what it says on the tin;
+            # each SKILL.md still goes through validate_skill_content below, so a
+            # broken one is skipped rather than silently written.
+            print(f"--yes: installing all {len(sources)}")
+            chosen = sources
+        else:
+            choice = _prompt("install which? (numbers comma-separated, or 'all'): ").strip()
+            if choice.lower() == "all":
+                chosen = sources
+            else:
+                try:
+                    picked = {int(x) for x in choice.split(",") if x.strip()}
+                except ValueError:
+                    print("skills add: not a valid selection", file=sys.stderr)
+                    return 2
+                chosen = [s for i, s in enumerate(sources, 1) if i in picked]
+            if not chosen:
+                print("nothing selected")
+                return 0
+    else:
+        chosen = sources
+
+    scope = "user" if args.user else "project"
+    installed: list[str] = []
+    for source in chosen:
+        try:
+            name, description = validate_skill_content(source.content, source.raw_url)
+        except SkillInstallError as exc:
+            print(f"skills add: skipping {source.name}: {exc}", file=sys.stderr)
+            continue
+
+        print(f"\nabout to install '{name}' from {source.raw_url}")
+        print(f"description: {description}")
+        print(_SKILL_TRUST_NOTICE)
+        if not args.yes:
+            if _prompt("install this skill? [y/N] ").strip().lower() not in ("y", "yes"):
+                print(f"skipped {name}")
+                continue
+
+        skill = install_skill(source.content, args.user, settings.project_root, name_hint=source.name)
+        print(f"installed {skill.name} ({scope}) from {source.raw_url} -> {skill.path}")
+        installed.append(skill.name)
+
+    return 0 if installed else 1
+
+
+def _cmd_skills_list(settings: Settings) -> int:
+    from turnloop.commands.loader import load_skills, rejected_skills
+
+    user_root = Path.home() / ".turnloop" / "skills"
+    skills = load_skills(settings.project_root)
+    rejected = rejected_skills(settings.project_root)
+    if not skills and not rejected:
+        print("no skills installed. `tl skills add <owner/repo>` or `tl skills import`.")
+        return 0
+    for skill in sorted(skills.values(), key=lambda s: s.name):
+        scope = "user" if user_root in skill.path.parents else "project"
+        print(f"  {skill.name:<20} {scope:<8} {skill.description}")
+    for rej in sorted(rejected, key=lambda r: str(r.path)):
+        print(f"  found at {rej.path}, ignored: {rej.reason}")
+    return 0
+
+
+def _cmd_skills_remove(settings: Settings, args: argparse.Namespace) -> int:
+    from turnloop.skills_install import remove_skill
+
+    scope = "user" if args.user else "project"
+    if not args.yes:
+        confirm = _prompt(f"remove skill '{args.name}' ({scope})? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("cancelled")
+            return 0
+    if remove_skill(args.name, args.user, settings.project_root):
+        print(f"removed {args.name} ({scope})")
+        return 0
+    print(f"skills remove: {args.name!r} not found in the {scope} scope", file=sys.stderr)
+    return 1
+
+
+def _cmd_skills_import(settings: Settings, args: argparse.Namespace, cwd: Path) -> int:
+    from turnloop.skills_install import (
+        find_claude_code_candidates,
+        import_selected,
+        mark_import_asked,
+    )
+
+    _print_skill_target(settings, args.user, cwd)
+
+    candidates = find_claude_code_candidates(settings.project_root)
+    mark_import_asked(settings.project_root)
+    if not candidates:
+        print("no un-imported skills found at ~/.claude/skills")
+        return 0
+
+    total = sum(c.tokens for c in candidates)
+    print(f"{len(candidates)} skill(s) at ~/.claude/skills not yet in turnloop "
+          f"(~{total:,} tokens of permanent system-prompt overhead if all imported):")
+    for i, c in enumerate(candidates, 1):
+        desc = c.description[:60] + ("..." if len(c.description) > 60 else "")
+        print(f"  {i}. {c.name:<20} ~{c.tokens:>4} tokens  {desc}")
+
+    if args.all:
+        chosen = candidates
+    else:
+        choice = _prompt("import which? (numbers comma-separated, 'all', or blank to skip): ").strip()
+        if not choice:
+            print("nothing imported. Run `tl skills import` again anytime.")
+            return 0
+        if choice.lower() == "all":
+            chosen = candidates
+        else:
+            try:
+                picked = {int(x) for x in choice.split(",") if x.strip()}
+            except ValueError:
+                print("skills import: not a valid selection", file=sys.stderr)
+                return 2
+            chosen = [c for i, c in enumerate(candidates, 1) if i in picked]
+
+    scope = "user" if args.user else "project"
+    names = {c.name for c in chosen}
+    imported = import_selected(candidates, names, args.user, settings.project_root)
+    for name in imported:
+        print(f"imported {name} ({scope})")
+    imported_tokens = sum(c.tokens for c in chosen if c.name in imported)
+    print(f"imported {len(imported)}/{len(candidates)} — ~{imported_tokens:,} tokens added")
+    return 0 if imported else 1
 
 
 def _cmd_doctor(settings: Settings, cwd: Path) -> int:

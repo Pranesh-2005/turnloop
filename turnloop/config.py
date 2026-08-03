@@ -139,6 +139,12 @@ class Settings(BaseModel):
     tool_verbosity: Verbosity = "normal"
     include_memory: bool = True
 
+    # Set once `tl skills import` (or the TUI's one-time startup notice) has
+    # asked about importing ~/.claude/skills. Written to the user-level
+    # settings.json so the question survives across every project — the
+    # candidates it points at live outside any one project too.
+    skills_import_asked: bool = False
+
     # Populated by load_settings, not by any file.
     project_root: Path = Field(default_factory=Path.cwd)
     sources: list[str] = Field(default_factory=list)
@@ -351,6 +357,29 @@ def find_project_root(start: Path) -> Path:
             if (candidate / marker).exists():
                 return candidate
     return start
+
+
+def guard_project_write_root(project_root: Path) -> None:
+    """Refuse to write a project-declaring file (`settings.json`, `skills/`, ...)
+    straight to a filesystem root.
+
+    `find_project_root` falls back to returning `start` unchanged when nothing
+    declares a project (see its docstring) -- and on a machine where a whole
+    drive is itself a git repo (`.git` is in `_PROJECT_MARKERS`, and `F:\\` is
+    one on the author's machine), that fallback can BE the drive root. Writing
+    one of `_TURNLOOP_DECLARATIONS` there would make `_is_declared` true for
+    every project on the drive from then on, permanently annexing whichever
+    of them lacks its own declaration -- the exact bug `_is_declared` exists
+    to prevent, re-created one level up. `path.parent == path` is true only at
+    a filesystem root, on both POSIX (`/`) and Windows (`F:\\`), so this one
+    check catches it without hardcoding drive letters.
+    """
+    if project_root.parent == project_root:
+        raise ConfigError(
+            f"{project_root} is a filesystem root, not a project -- refusing to "
+            "write turnloop project files there. Run this command from inside "
+            "your project directory, or pass --user to use user-scope settings/skills."
+        )
 
 
 def _read_json(path: Path) -> dict:

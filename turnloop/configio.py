@@ -34,7 +34,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from turnloop.config import MCPServerConfig, Settings, deep_merge, default_settings
+from turnloop.config import (
+    MCPServerConfig,
+    Settings,
+    deep_merge,
+    default_settings,
+    guard_project_write_root,
+)
 from turnloop.errors import ConfigError
 from turnloop.sessions.store import default_project_dir
 
@@ -121,8 +127,17 @@ def _ensure_gitignored(path: Path, project_root: Path) -> None:
     `default_project_dir` writes a `.gitignore` covering `settings.local.json`.
     Skipping this step means a secret-bearing local settings file can land in a
     fresh checkout with nothing stopping `git add -A` from committing it.
+
+    Every writer in this module (`write_settings_patch`, `append_allow_rule`,
+    `remove_mcp_server`) routes through here first, so this is also the one
+    place that needs to refuse a bogus root: `settings.json` and
+    `settings.local.json` are both `_TURNLOOP_DECLARATIONS` (config.py) --
+    writing either one to a filesystem root a project resolver fell back to
+    would permanently annex it, the same hole `skills_install.install_skill`
+    has for `skills/`.
     """
     if path.parent == project_root / ".turnloop":
+        guard_project_write_root(project_root)
         default_project_dir(project_root)
 
 

@@ -8,6 +8,8 @@ rather than being dropped.
 
 from __future__ import annotations
 
+import json
+
 import anyio
 
 from turnloop.providers.mock import MockProvider, ScriptTurn
@@ -604,6 +606,34 @@ async def test_continue_flag_resolves_to_the_last_session_sentinel():
 
     args = build_parser().parse_args(["--resume", "ses_123"])
     assert args.resume == "ses_123"
+
+
+async def test_claude_code_skills_notice_shows_once_then_not_again(
+    settings, project, monkeypatch, tmp_path
+):
+    """The one-time import notice (see `skills_install.find_claude_code_candidates`)
+    fires when there is something to import and the user has never been asked, and
+    persists the "asked" flag so a second launch stays quiet."""
+    claude_dir = tmp_path / "claude-skills"
+    (claude_dir / "demo").mkdir(parents=True)
+    (claude_dir / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: a demo\n---\nbody\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("turnloop.skills_install.CLAUDE_CODE_SKILLS_DIR", claude_dir)
+    fake_user_path = tmp_path / "home" / ".turnloop" / "settings.json"
+    monkeypatch.setattr("turnloop.configio.user_settings_path", lambda: fake_user_path)
+
+    app = app_with(settings, project, [ScriptTurn(text="hi")])
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert "tl skills import" in _transcript_text(app)
+    assert settings.skills_import_asked is True
+    assert json.loads(fake_user_path.read_text(encoding="utf-8")) == {"skills_import_asked": True}
+
+    app2 = app_with(settings, project, [ScriptTurn(text="hi")])
+    async with app2.run_test() as pilot:
+        await pilot.pause()
+        assert "tl skills import" not in _transcript_text(app2)
 
 
 def _transcript_text(app: TurnloopApp) -> str:

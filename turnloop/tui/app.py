@@ -122,10 +122,42 @@ class TurnloopApp(App):
                 f"this provider bills ${self.agent.provider.caps.cost_per_hour:.2f}/hour of "
                 "wall clock; the first request may cold-boot for ~29 minutes",
             )
+        self._notice_claude_code_skills()
         self.query_one(Input).focus()
 
         if self._pending_picker:
             self._open_picker_at_startup()
+
+    def _notice_claude_code_skills(self) -> None:
+        """Point at `tl skills import` once, if there is anything to import.
+
+        Not a modal: importing means fetching a token cost and letting the
+        user pick a subset (see `skills_install.import_selected`), which is
+        real interaction, not a yes/no `push_screen_wait`. A blocking prompt
+        on every launch is hostile (the brief this shipped from says so
+        explicitly), and doing the actual picking here would need a third
+        modal class for something the CLI already does in a few lines. A
+        one-line pointer, asked once and then never again, is the smallest
+        thing that satisfies "ask, don't nag" without adding a screen.
+        `skills_import_asked` lives in the user-level settings file, so this
+        note fires at most once ever, not once per project.
+        """
+        if self.settings.skills_import_asked:
+            return
+        from turnloop.skills_install import find_claude_code_candidates, mark_import_asked
+
+        candidates = find_claude_code_candidates(self.settings.project_root)
+        if candidates:
+            total = sum(c.tokens for c in candidates)
+            transcript = self.query_one(Transcript)
+            self.call_later(
+                transcript.add_note,
+                f"{len(candidates)} skill(s) found at ~/.claude/skills not yet in turnloop "
+                f"(~{total:,} tokens of permanent system-prompt overhead if all imported). "
+                "Run `tl skills import` to review -- nothing is imported automatically.",
+            )
+        mark_import_asked(self.settings.project_root)
+        self.settings.skills_import_asked = True
 
     # --- input ------------------------------------------------------------
 
