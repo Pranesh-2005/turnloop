@@ -114,6 +114,15 @@ Frontmatter is YAML, not markdown, and needs `description` or it is dropped \
   name: my-skill
   description: one line the model uses to decide when to load this
   ---
+  Installing one is the user's job, not yours: `tl skills add <owner/repo>` \
+fetches and validates a SKILL.md, and `tl skills import` adopts skills already \
+on the machine. Skill repos publish install scripts for other agents \
+(`/plugin ...`, `clawhub`, `npm install`) — none of those put anything where \
+turnloop looks, so never run them. Point the user at `tl skills add` instead.
+- MCP tools: once a server above is connected, its tools appear as ordinary \
+callable tools — never shell out to an MCP server's binary or CLI. If the user \
+names a server that is not connected (see Environment for what is), tell them \
+to add it with `/mcp add` or `tl mcp`; do not improvise a shell command instead.
 """
 
 PLAN_MODE = """\
@@ -212,6 +221,11 @@ def environment_segment(cwd: Path, settings: Settings, caps: Capabilities) -> st
         f"- Shell: {shell_desc}",
         f"- Today: {date.today().isoformat()}",
         f"- Context window: {caps.max_context:,} tokens",
+        # The one fact that would have stopped a real session from shelling out to
+        # "playwright mcp verify": whether any MCP server is even configured. Naming
+        # them here is cheap (a handful of tokens) and is exactly what CONFIG_LAYOUT's
+        # MCP guidance needs to be actionable.
+        "- MCP servers: " + (", ".join(sorted(settings.mcp_servers)) or "none configured"),
     ]
 
     if caps.max_context <= 100_000:

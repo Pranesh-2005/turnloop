@@ -271,6 +271,13 @@ def _prompt(text: str) -> str:
         raise SystemExit(1) from None
 
 
+# A collection install can run to hundreds of skills (alirezarezvani/claude-skills:
+# ~340). Printing one block per skill -- skip report or install report alike --
+# floods the console past anything readable and buries the result that matters.
+# Capped console output, not capped work: everything past the cap still installs
+# (or gets skipped and counted), just without its own paragraph on screen.
+_CONSOLE_PREVIEW_LIMIT = 5
+
 _SKILL_TRUST_NOTICE = (
     "Its body will be loaded into the model's context whenever the model decides "
     "it applies -- this is the same class of trust decision as adding an MCP "
@@ -298,15 +305,39 @@ def _cmd_skills_add(settings: Settings, args: argparse.Namespace, cwd: Path) -> 
             return await fetch_skill_sources(args.source, client)
 
     try:
-        sources = anyio.run(_fetch)
+        result = anyio.run(_fetch)
     except SkillInstallError as exc:
         print(f"skills add: {exc}", file=sys.stderr)
         return 1
 
+    sources = result.sources
+    # Non-fatal per-name ambiguity (see skills_install.SkillFetchResult) -- the
+    # rest of the collection still installs; this only reports what got
+    # skipped and how to get it directly, instead of a dead end. Full detail
+    # (the candidate raw-URL commands) only for the first few, or a repo with
+    # hundreds of dot-mirrored skills turns this into a thousand-line scroll.
+    for skill_name, commands in result.skipped[:_CONSOLE_PREVIEW_LIMIT]:
+        print(f"skills add: skipping '{skill_name}' (ambiguous) -- install directly:",
+              file=sys.stderr)
+        for command in commands:
+            print(f"  {command}", file=sys.stderr)
+    rest = result.skipped[_CONSOLE_PREVIEW_LIMIT:]
+    if rest:
+        print(f"skills add: ...and {len(rest)} more ambiguous, skipped: "
+              f"{', '.join(name for name, _ in rest)}", file=sys.stderr)
+        print(f"skills add: see candidate paths for any of these with "
+              f"`tl skills add {args.source}/<name>`", file=sys.stderr)
+
+    if not sources:
+        print("skills add: nothing to install", file=sys.stderr)
+        return 1
+
     if len(sources) > 1:
         print(f"{args.source} contains {len(sources)} skills:")
-        for i, s in enumerate(sources, 1):
+        for i, s in enumerate(sources[:_CONSOLE_PREVIEW_LIMIT], 1):
             print(f"  {i}. {s.name}")
+        if len(sources) > _CONSOLE_PREVIEW_LIMIT:
+            print(f"  ... and {len(sources) - _CONSOLE_PREVIEW_LIMIT} more")
         if args.yes:
             # `--yes` means "don't make me answer prompts", and the collection
             # selector is a prompt like any other -- treating it differently would
@@ -336,24 +367,55 @@ def _cmd_skills_add(settings: Settings, args: argparse.Namespace, cwd: Path) -> 
 
     scope = "user" if args.user else "project"
     installed: list[str] = []
+    # Counts *valid* skills only -- a repo can front-load its tree with content
+    # that fails validation (this real one puts several dot-mirrored meta files
+    # with no description first, alphabetically); counting raw loop position
+    # instead meant the preview cap never fired at all, since every one of the
+    # first several iterations `continue`d before reaching the announce block.
+    announced = 0
+    invalid = 0
     for source in chosen:
         try:
             name, description = validate_skill_content(source.content, source.raw_url)
         except SkillInstallError as exc:
-            print(f"skills add: skipping {source.name}: {exc}", file=sys.stderr)
+            # Same cap as everything else here: this real repo has ~96 skills
+            # (dot-mirrored meta files like README/TEMPLATE) that all fail with
+            # the identical multi-line "no description" explanation -- printed
+            # in full 96 times, that's the same flood as the ambiguity report
+            # before it was capped, just with a different trigger.
+            if invalid < _CONSOLE_PREVIEW_LIMIT:
+                print(f"skills add: skipping {source.name}: {exc}", file=sys.stderr)
+            invalid += 1
             continue
 
-        print(f"\nabout to install '{name}' from {source.raw_url}")
-        print(f"description: {description}")
-        print(_SKILL_TRUST_NOTICE)
+        # Full per-skill detail (description, trust notice) only for the first
+        # few -- same reasoning as the skip report above: a repo with hundreds
+        # of skills would otherwise bury the result in noise. The interactive
+        # prompt still names the skill either way, so consent stays meaningful.
+        show_detail = announced < _CONSOLE_PREVIEW_LIMIT
+        announced += 1
+        if show_detail:
+            print(f"\nabout to install '{name}' from {source.raw_url}")
+            print(f"description: {description}")
+            print(_SKILL_TRUST_NOTICE)
+        elif not args.yes:
+            print(f"\nabout to install '{name}'")
         if not args.yes:
             if _prompt("install this skill? [y/N] ").strip().lower() not in ("y", "yes"):
                 print(f"skipped {name}")
                 continue
 
         skill = install_skill(source.content, args.user, settings.project_root, name_hint=source.name)
-        print(f"installed {skill.name} ({scope}) from {source.raw_url} -> {skill.path}")
+        if show_detail:
+            print(f"installed {skill.name} ({scope}) from {source.raw_url} -> {skill.path}")
         installed.append(skill.name)
+
+    if invalid > _CONSOLE_PREVIEW_LIMIT:
+        print(f"skills add: ...and {invalid - _CONSOLE_PREVIEW_LIMIT} more skipped (failed validation)",
+              file=sys.stderr)
+
+    if len(installed) > _CONSOLE_PREVIEW_LIMIT:
+        print(f"... and {len(installed) - _CONSOLE_PREVIEW_LIMIT} more installed ({scope})")
 
     return 0 if installed else 1
 

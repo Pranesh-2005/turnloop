@@ -141,7 +141,12 @@ This is not a search engine. If you do not have a URL, ask the user for one.
         """Summarize the page against the prompt using the session's provider."""
         provider = ctx.extras.get("provider")
         if provider is None:
-            return f"(no provider available to summarize; first 4000 chars)\n\n{text[:4000]}"
+            excerpt = _readable_excerpt(text, 4000)
+            return (
+                "(no provider available to summarize this page — the text below is an "
+                "unsummarized excerpt, not an answer to the prompt; read it yourself)\n\n"
+                f"{excerpt}"
+            )
 
         from turnloop.core.events import MessageDone
         from turnloop.core.messages import Message
@@ -164,8 +169,14 @@ This is not a search engine. If you do not have a URL, ask the user for one.
                 if isinstance(event, MessageDone):
                     return event.message.text.strip() or "(the model returned nothing)"
         except Exception as exc:  # noqa: BLE001
-            return f"(summarization failed: {exc})\n\nFirst 4000 characters:\n{text[:4000]}"
-        return text[:4000]
+            return (
+                f"(summarization failed: {exc}; unsummarized excerpt below, not an answer)\n\n"
+                f"{_readable_excerpt(text, 4000)}"
+            )
+        return (
+            "(summarization returned no events; unsummarized excerpt below)\n\n"
+            f"{_readable_excerpt(text, 4000)}"
+        )
 
     def summary(self, args: WebFetchArgs) -> str:  # type: ignore[override]
         return f"WebFetch {args.url}"
@@ -195,7 +206,12 @@ class _TextExtractor(HTMLParser):
             self._skip_depth += 1
         elif tag in self.BLOCK:
             self.parts.append("\n")
-        if tag == "li":
+        # Root cause of the empty-bullet chrome: this used to fire unconditionally,
+        # so a <li> nested inside a skipped <nav>/<header> still emitted its "- "
+        # marker even though handle_data() below would never contribute any text
+        # for it. Gating on skip_depth stops the marker at its source instead of
+        # relying on the text() filter to clean it up afterward.
+        if tag == "li" and not self._skip_depth:
             self.parts.append("- ")
 
     def handle_endtag(self, tag: str) -> None:
@@ -216,6 +232,14 @@ class _TextExtractor(HTMLParser):
         out: list[str] = []
         blank = 0
         for line in lines:
+            # A "- " list item whose only content was an icon (an <svg>, which SKIP
+            # already drops) collapses to a bare "-". GitHub-style pages are full of
+            # these — two real fetches in one session returned 6k and 23k characters
+            # that were nothing but "Skip to content" plus dozens of empty bullets.
+            # Dropping them here, in the shared conversion path, fixes every caller
+            # at once instead of patching each place that reads the result.
+            if line == "-":
+                continue
             if not line:
                 blank += 1
                 if blank > 1:
@@ -224,6 +248,20 @@ class _TextExtractor(HTMLParser):
                 blank = 0
             out.append(line)
         return "\n".join(out).strip()
+
+
+def _readable_excerpt(text: str, limit: int) -> str:
+    """First `limit` chars of already-cleaned text, on a line boundary where possible.
+
+    Cutting mid-line at an arbitrary character offset was never the bug — the bug
+    was that the text handed to this function was still full of chrome. Now that
+    html_to_text() strips empty bullets, a plain slice is enough; this just avoids
+    truncating mid-word at the boundary.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    return text[: cut if cut > limit // 2 else limit].rstrip() + "\n…(truncated)"
 
 
 def html_to_text(html: str) -> str:

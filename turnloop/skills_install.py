@@ -8,10 +8,11 @@ silently drops the file — see that module's fix) before anything touches disk,
 and neither one writes without the caller having seen where the content came
 from.
 
-`add` (`fetch_skill_sources` below) resolves a GitHub repo shorthand, a repo
-URL, or a direct raw URL to one or more `SKILL.md` bodies. It never writes on
-its own -- `install_skill` is the only function that touches disk, same
-one-writer shape as `configio.py`.
+`add` (`fetch_skill_sources` below) resolves a GitHub repo shorthand
+(`owner/repo`, or `owner/repo/<skill-name>` for exactly one skill out of a
+collection), a repo URL, or a direct raw URL to one or more `SKILL.md`
+bodies. It never writes on its own -- `install_skill` is the only function
+that touches disk, same one-writer shape as `configio.py`.
 
 Import (`find_claude_code_candidates` / `import_selected`) is a one-time,
 opt-in copy of `~/.claude/skills/*/SKILL.md` into turnloop's own skills
@@ -23,10 +24,12 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 
 from turnloop.commands.loader import Skill, load_skills, parse_frontmatter
@@ -36,7 +39,20 @@ from turnloop.errors import TurnloopError
 
 CLAUDE_CODE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 
-_REPO_RE = re.compile(r"^(?:https?://github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+# GitHub shorthand, with an optional tail: `owner/repo`, or `owner/repo/<tail>`
+# to select one skill out of the repo's collection (single skill name, or a
+# deeper path fragment -- see `_select_by_tail`). A real session tried
+# `owner/repo/<skill-name>` three times before giving up, because the old
+# two-segment-only pattern fell through to the raw-URL branch and failed with
+# an `UnsupportedProtocol` error that named no actual problem.
+_REPO_RE = re.compile(r"^(?:https?://github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/(.+))?/?$")
+
+# Bounded concurrency for fetching many SKILL.md bodies at once (bug: serial
+# round-trips for a repo's ~18 skills blew through the 120s tool-call budget
+# fetching them one at a time after listing them all in a second). 8 is a
+# nod to "don't hammer the GitHub API", not a measured number -- raise if a
+# real rate-limit response ever shows up here.
+_FETCH_CONCURRENCY = 8
 
 
 class SkillInstallError(TurnloopError):
@@ -50,6 +66,29 @@ class SkillSource:
     name: str
     raw_url: str
     content: str
+
+
+@dataclass(slots=True)
+class SkillFetchResult:
+    """What `fetch_skill_sources` resolved: sources ready to install, plus any
+    names skipped as ambiguous during a *collection* install.
+
+    Ambiguity is never fatal here -- a collection can span hundreds of
+    skills, and one tie must not zero out the rest (the reported bug: one
+    ambiguous name among 345 took the whole install to zero). It stays fatal
+    only when the user asked for that one skill by name (the
+    `owner/repo/<skill-name>` form, resolved by `_select_by_tail`), where a
+    real choice exists to make.
+
+    Each skipped entry carries ready-to-run `tl skills add <raw-url>`
+    commands, not bare paths -- an ambiguity message that names paths but not
+    a runnable next step sends the model guessing at raw URLs on its own,
+    which is exactly what turned into three 404s in the session that
+    reported this (these repos nest skills under category directories).
+    """
+
+    sources: list[SkillSource]
+    skipped: list[tuple[str, list[str]]]  # skill name -> candidate install commands
 
 
 @dataclass(slots=True)
@@ -76,32 +115,125 @@ class ImportCandidate:
 # --------------------------------------------------------------------------
 
 
-async def fetch_skill_sources(source: str, client: httpx.AsyncClient) -> list[SkillSource]:
+async def fetch_skill_sources(source: str, client: httpx.AsyncClient) -> SkillFetchResult:
     """Resolve `source` to raw content: a direct file, or every SKILL.md in a repo."""
     direct = _direct_raw_url(source)
     if direct:
-        return [SkillSource(name=_name_from_path(direct), raw_url=direct,
-                             content=await _get_text(client, direct))]
+        content = await _get_text(client, direct)
+        return SkillFetchResult(
+            sources=[SkillSource(name=_name_from_path(direct), raw_url=direct, content=content)],
+            skipped=[],
+        )
 
     repo = _REPO_RE.match(source.strip())
     if repo is None:
         # Not a recognized shorthand or GitHub URL — try it as a raw URL to a
         # SKILL.md as-is (e.g. a gist, a self-hosted raw file server).
-        return [SkillSource(name=_name_from_path(source), raw_url=source,
-                             content=await _get_text(client, source))]
+        content = await _get_text(client, source)
+        return SkillFetchResult(
+            sources=[SkillSource(name=_name_from_path(source), raw_url=source, content=content)],
+            skipped=[],
+        )
 
-    owner, name = repo.group(1), repo.group(2)
+    owner, name, tail = repo.group(1), repo.group(2), repo.group(3)
     branch = await _default_branch(client, owner, name)
     paths = await _list_skill_md_paths(client, owner, name, branch)
     if not paths:
         raise SkillInstallError(f"no SKILL.md found in {owner}/{name}")
-    paths = _dedupe_skill_paths(paths)  # before fetching -- no point downloading a copy we'll discard
-    sources = []
-    for path in paths:
-        raw_url = f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
-        sources.append(SkillSource(name=_name_from_path(path), raw_url=raw_url,
-                                    content=await _get_text(client, raw_url)))
-    return sources
+
+    def raw_url(path: str) -> str:
+        return f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
+
+    if tail:
+        # `owner/repo/<skill-name>` (or a deeper `owner/repo/<dir>/<skill-name>`)
+        # -- the model asked for exactly one skill, so ambiguity here is fatal
+        # (a real choice to make), unlike the collection branch below.
+        path = _select_by_tail(paths, tail.rstrip("/"), raw_url)
+        content = await _get_text(client, raw_url(path))
+        return SkillFetchResult(
+            sources=[SkillSource(name=_name_from_path(path), raw_url=raw_url(path), content=content)],
+            skipped=[],
+        )
+
+    # before fetching -- no point downloading a copy we'll discard
+    winners, ambiguous = _dedupe_skill_paths(paths)
+    sources = await _fetch_many(client, winners, raw_url)
+    skipped = [
+        (skill_name, [f"tl skills add {raw_url(p)}" for p in tied])
+        for skill_name, tied in ambiguous
+    ]
+    return SkillFetchResult(sources=sources, skipped=skipped)
+
+
+def _select_by_tail(paths: list[str], tail: str, raw_url: Callable[[str], str]) -> str:
+    """Resolve `owner/repo/<tail>` to exactly one SKILL.md path.
+
+    `tail` with no `/` is a skill *name* -- matched the same way
+    `_dedupe_skill_paths` picks a canonical copy (drop dot-prefixed mirror
+    paths first, then shallowest path wins; a tie surviving both is genuine
+    ambiguity). A tail with `/` is a deeper path fragment into the repo
+    (`owner/repo/<dir>/<skill-name>`) -- matched by directory suffix instead,
+    since two different-named skills share nothing to disambiguate them by
+    name alone.
+
+    Ambiguity here is always a hard error, unlike a collection install: the
+    caller asked for one specific skill, so there is a real choice to make --
+    and the error names actual raw-URL commands to run (the bug report: a
+    vague "install by raw URL instead" with no URL sent the model guessing
+    three, all 404s, because these repos nest skills under category dirs).
+    """
+    if "/" in tail:
+        suffix = f"/{tail}/SKILL.md"
+        matches = [p for p in paths if p == f"{tail}/SKILL.md" or p.endswith(suffix)]
+    else:
+        matches = [p for p in paths if _name_from_path(p) == tail]
+        if matches:
+            non_mirror = [p for p in matches if not _is_agent_mirror_path(p)]
+            matches = non_mirror or matches
+            shallowest = min(p.count("/") for p in matches)
+            matches = [p for p in matches if p.count("/") == shallowest]
+
+    if not matches:
+        available = sorted({_name_from_path(p) for p in paths})
+        raise SkillInstallError(
+            f"no skill named '{tail}' in this repo. Available: {', '.join(available)}"
+        )
+    if len(matches) > 1:
+        commands = "\n  ".join(f"tl skills add {raw_url(p)}" for p in sorted(matches))
+        raise SkillInstallError(
+            f"'{tail}' is ambiguous -- {len(matches)} equally-plausible paths. "
+            f"Install one directly:\n  {commands}"
+        )
+    return matches[0]
+
+
+async def _fetch_many(
+    client: httpx.AsyncClient, paths: list[str], raw_url: Callable[[str], str]
+) -> list[SkillSource]:
+    """Fetch every path's SKILL.md concurrently, bounded by `_FETCH_CONCURRENCY`.
+
+    Serial round-trips were the entire cost of a real timeout: a repo's ~18
+    skills at roughly a second each blew straight through the 120s tool-call
+    budget, fetching one at a time after listing them all in a second. Results
+    are reassembled in `paths`' order regardless of completion order --
+    same shape as `agent/loop.py`'s parallel tool dispatch -- so output stays
+    deterministic no matter which request happens to land first.
+    """
+    sem = anyio.Semaphore(_FETCH_CONCURRENCY)
+    results: dict[str, SkillSource] = {}
+
+    async def _one(path: str) -> None:
+        async with sem:
+            url = raw_url(path)
+            results[path] = SkillSource(
+                name=_name_from_path(path), raw_url=url, content=await _get_text(client, url)
+            )
+
+    async with anyio.create_task_group() as tg:
+        for path in paths:
+            tg.start_soon(_one, path)
+
+    return [results[path] for path in paths]
 
 
 def _direct_raw_url(source: str) -> str | None:
@@ -165,8 +297,21 @@ async def _list_skill_md_paths(
     )
 
 
-def _dedupe_skill_paths(paths: list[str]) -> list[str]:
-    """One winning path per install name -- never two paths writing the same target.
+def _is_agent_mirror_path(path: str) -> bool:
+    """True if any directory component before `SKILL.md` starts with `.`.
+
+    A dot-prefixed directory (`.openclaw/`, `.gemini/`, `.claude/`, `.cursor/`,
+    ...) is always some *other* harness's own convention for finding skills,
+    never the repo author's canonical source -- that is what the dot-prefix
+    means on every tool's directory, by construction, not a fact specific to
+    any one of them. Deliberately not a hardcoded list of known agent names:
+    the next agent to invent `.whatever/skills/` needs no code change here.
+    """
+    return any(part.startswith(".") for part in path.split("/")[:-1])
+
+
+def _dedupe_skill_paths(paths: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """One winning path per install name, plus any names left ambiguous.
 
     A repo can ship the same skill twice: once at `skills/<name>/SKILL.md` for
     itself, once at `.openclaw/skills/<name>/SKILL.md` (or any other harness's
@@ -175,29 +320,48 @@ def _dedupe_skill_paths(paths: list[str]) -> list[str]:
     so installing "all" would write the same target twice, second write
     silently winning with no sign a collision happened.
 
-    Shallower path wins: fewer directory components before `SKILL.md` reads as
-    "closer to the repo's own root", which is a reasonable proxy for "the
-    canonical copy" for any repo, not just one with a `.openclaw/` layout. A
-    tie at equal depth is a genuine ambiguity -- e.g. `docs/x/SKILL.md` vs
-    `examples/x/SKILL.md` -- and gets refused rather than resolved by
-    guessing; the caller can still install either directly by raw URL.
+    Two tiebreaks, in order:
+
+    1. Drop dot-prefixed-directory candidates first (`_is_agent_mirror_path`)
+       -- those are always some other harness's mirror, never the canonical
+       copy. This has to run *before* depth: a real repo (`alirezarezvani/
+       claude-skills`) mirrors its entire tree under `.gemini/skills/<name>/`
+       at the *same* depth as the true `<category>/skills/<name>/` source, so
+       depth alone cannot break that tie -- it left only 5 of ~340 skills
+       installed (everything else "tied" against its own `.gemini` mirror).
+    2. Among what is left, shallower path wins: fewer directory components
+       before `SKILL.md` reads as "closer to the repo's own root", a
+       reasonable proxy for "the canonical copy" once mirrors are already
+       excluded.
+
+    A tie surviving both -- e.g. `docs/x/SKILL.md` vs `examples/x/SKILL.md`,
+    neither dot-prefixed, same depth -- is a genuine ambiguity.
+
+    That genuine tie is returned as `skipped`, not raised: a collection
+    install can span hundreds of skills (the reported bug: one ambiguous name
+    took the whole run to zero, because the old code raised here and killed
+    everything). The caller installs every unambiguous winner and reports the
+    skipped names with their candidate paths, so the one the user actually
+    wants can still be installed directly by name (`owner/repo/<skill-name>`,
+    see `_select_by_tail`) -- where the same tie is a hard error, because
+    there a real choice exists to make.
     """
     by_name: dict[str, list[str]] = {}
     for p in paths:
         by_name.setdefault(_name_from_path(p), []).append(p)
 
     winners = []
+    skipped = []
     for name, candidates in by_name.items():
-        shallowest = min(p.count("/") for p in candidates)
-        tied = [p for p in candidates if p.count("/") == shallowest]
+        non_mirror = [p for p in candidates if not _is_agent_mirror_path(p)]
+        pool = non_mirror or candidates  # all-mirror is still something to install
+        shallowest = min(p.count("/") for p in pool)
+        tied = [p for p in pool if p.count("/") == shallowest]
         if len(tied) > 1:
-            raise SkillInstallError(
-                f"'{name}' has {len(tied)} equally-plausible SKILL.md paths and "
-                f"cannot be resolved automatically: {', '.join(sorted(tied))}. "
-                "Install one directly by its raw URL instead."
-            )
+            skipped.append((name, sorted(tied)))
+            continue
         winners.append(tied[0])
-    return sorted(winners)
+    return sorted(winners), sorted(skipped)
 
 
 def _name_from_path(path_or_url: str) -> str:

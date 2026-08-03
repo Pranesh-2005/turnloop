@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnloop"
-version = "0.1.8"
+version = "0.1.10"
 description = "A local-first agentic coding harness: streaming tool loop, permission gating, context compaction, subagents, and any LLM provider."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -53,6 +53,14 @@ Homepage = "https://github.com/Pranesh-2005/turnloop"
 
 [tool.hatch.build.targets.wheel]
 packages = ["turnloop"]
+
+# Without an explicit include, the sdist sweeps up whatever happens to be sitting
+# in the working tree. A stray `git clone` left behind by a failed skill install
+# put 157 of 317 entries — 4.2 MB of an unrelated repository — into the 0.1.8
+# sdist before this was pinned down. An allowlist fails closed: new junk is not
+# published, and a genuinely new top-level path has to be added here on purpose.
+[tool.hatch.build.targets.sdist]
+include = ["turnloop", "tests", "README.md", "pyproject.toml", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

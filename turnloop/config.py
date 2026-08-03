@@ -71,7 +71,11 @@ class PermissionConfig(BaseModel):
 
 class BashConfig(BaseModel):
     shell: str | None = None  # explicit path wins over autodetection
-    default_timeout_ms: int = 120_000
+    # 120s was the original default and was too low for ordinary work — a user's
+    # oldest recurring complaint (since 0.1.2) was legitimate commands (e.g. a
+    # `tl skills add` mid-fetch) getting killed before they finished. 300s gives
+    # real work room without raising the ceiling models can already ask for.
+    default_timeout_ms: int = 300_000
     max_timeout_ms: int = 600_000
     max_output_chars: int = 30_000
     max_output_lines: int = 2_000

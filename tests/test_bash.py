@@ -112,6 +112,50 @@ async def test_a_timeout_kills_the_process_tree(ctx):
     assert elapsed < 15, f"kill took {elapsed:.1f}s — the tree was probably orphaned"
 
 
+@pytest.mark.slow
+async def test_timeout_message_names_the_applied_limit_and_how_to_raise_it(ctx):
+    """A bare "timed out after Ns" is a dead end: the model either gives up or
+
+    retries the identical command. The message must say what limit was actually
+    applied, that timeout_ms is a parameter it can raise, and the ceiling — the
+    same class of fix as the permanent-deny message in runner.py.
+    """
+    out = await run_bash(ctx, "sleep 30", timeout_ms=800)
+
+    assert out.is_error
+    assert "timeout_ms" in out.content
+    assert "800ms" in out.content
+    assert str(ctx.settings.bash.max_timeout_ms) in out.content
+
+
+@pytest.mark.slow
+async def test_default_timeout_is_actually_300_seconds(ctx):
+    """The old 120s default killed real work mid-flight (a `tl skills add` in the
+
+    session that motivated this fix). Prove the raised default is what actually
+    gets applied when the caller passes no timeout_ms at all, by running a
+    command that outlives the old default but not the new one.
+    """
+    assert ctx.settings.bash.default_timeout_ms == 300_000
+
+    started = time.monotonic()
+    out = await run_bash(ctx, "sleep 3")
+    elapsed = time.monotonic() - started
+
+    assert not out.is_error
+    assert elapsed < 300, "the 300s default should not have fired for a 3s command"
+
+
+@pytest.mark.slow
+async def test_an_explicit_timeout_above_the_ceiling_is_clamped(ctx):
+    """`timeout_ms` is honored when given, but never past `max_timeout_ms`."""
+    ctx.settings.bash.max_timeout_ms = 1_000
+    out = await run_bash(ctx, "sleep 30", timeout_ms=999_999)
+
+    assert out.is_error
+    assert "timed out after 1s" in out.content
+
+
 async def test_working_directory_is_the_agents_cwd(ctx, project):
     (project / "marker.txt").write_text("x", encoding="utf-8")
     out = await run_bash(ctx, "ls")

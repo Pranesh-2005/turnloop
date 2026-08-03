@@ -21,6 +21,7 @@ from turnloop.commands.loader import load_skills
 from turnloop.config import default_settings, load_settings
 from turnloop.errors import ConfigError
 from turnloop.skills_install import (
+    SkillFetchResult,
     SkillInstallError,
     SkillSource,
     fetch_skill_sources,
@@ -178,12 +179,13 @@ async def test_fetch_direct_raw_url():
         return httpx.Response(200, text=VALID_SKILL)
 
     async with mock_client(handler) as client:
-        sources = await fetch_skill_sources(
+        result = await fetch_skill_sources(
             "https://raw.githubusercontent.com/o/r/main/SKILL.md", client
         )
 
-    assert len(sources) == 1
-    assert sources[0].content == VALID_SKILL
+    assert len(result.sources) == 1
+    assert result.sources[0].content == VALID_SKILL
+    assert result.skipped == []
     # `name` here is only a display fallback used before frontmatter is parsed
     # (see `install_skill`, which prefers the real `name:` field every time) --
     # for a direct URL it is just the URL's last path segment before the file.
@@ -204,10 +206,10 @@ async def test_fetch_repo_shorthand_with_a_single_root_skill():
         raise AssertionError(f"unexpected request: {request.url}")
 
     async with mock_client(handler) as client:
-        sources = await fetch_skill_sources("o/r", client)
+        result = await fetch_skill_sources("o/r", client)
 
-    assert len(sources) == 1
-    assert sources[0].content == VALID_SKILL
+    assert len(result.sources) == 1
+    assert result.sources[0].content == VALID_SKILL
 
 
 async def test_fetch_repo_collection_lets_multiple_skills_come_back():
@@ -226,9 +228,91 @@ async def test_fetch_repo_collection_lets_multiple_skills_come_back():
         return httpx.Response(200, text=VALID_SKILL)
 
     async with mock_client(handler) as client:
-        sources = await fetch_skill_sources("https://github.com/o/r", client)
+        result = await fetch_skill_sources("https://github.com/o/r", client)
 
-    assert {s.name for s in sources} == {"one", "two"}
+    assert {s.name for s in result.sources} == {"one", "two"}
+    assert result.skipped == []
+
+
+# --------------------------------------------------------------------------
+# `owner/repo/<skill-name>` -- select exactly one skill out of a collection
+# (the real bug: the old two-segment-only regex fell through to the raw-URL
+# branch and failed with an `UnsupportedProtocol` error naming no real problem)
+# --------------------------------------------------------------------------
+
+
+async def test_fetch_owner_repo_skill_name_selects_that_one_skill_from_a_collection():
+    """Mirrors the real session: skills nested under a category directory, and
+    the model guesses `owner/repo/<skill-name>` for exactly one of them."""
+    tree = {"tree": [
+        {"path": "artifacts-builder/algorithmic-art/SKILL.md", "type": "blob"},
+        {"path": "artifacts-builder/other-thing/SKILL.md", "type": "blob"},
+    ]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "git/trees" in url:
+            return httpx.Response(200, json=tree)
+        if url.startswith("https://api.github.com/repos/anthropics/skills"):
+            return httpx.Response(200, json={"default_branch": "main"})
+        if "algorithmic-art/SKILL.md" in url:
+            return httpx.Response(200, text=VALID_SKILL)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with mock_client(handler) as client:
+        result = await fetch_skill_sources("anthropics/skills/algorithmic-art", client)
+
+    assert len(result.sources) == 1
+    assert result.sources[0].name == "algorithmic-art"
+    assert result.sources[0].content == VALID_SKILL
+    assert result.skipped == []
+
+
+async def test_fetch_owner_repo_deep_path_selects_by_directory_fragment():
+    """4+ segments: the tail is a path fragment (category/name), not a bare
+    name -- still resolved sensibly instead of falling into the URL branch."""
+    tree = {"tree": [
+        {"path": "artifacts-builder/algorithmic-art/SKILL.md", "type": "blob"},
+    ]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "git/trees" in url:
+            return httpx.Response(200, json=tree)
+        if url.startswith("https://api.github.com/repos/o/r"):
+            return httpx.Response(200, json={"default_branch": "main"})
+        return httpx.Response(200, text=VALID_SKILL)
+
+    async with mock_client(handler) as client:
+        result = await fetch_skill_sources("o/r/artifacts-builder/algorithmic-art", client)
+
+    assert len(result.sources) == 1
+    assert result.sources[0].name == "algorithmic-art"
+
+
+async def test_fetch_owner_repo_unknown_skill_name_lists_available_names():
+    """A bogus skill name must name what actually exists, not just fail --
+    the did-you-mean list is the whole point of resolving this shorthand at
+    all instead of leaving it to a confusing URL-parsing error."""
+    tree = {"tree": [
+        {"path": "skills/one/SKILL.md", "type": "blob"},
+        {"path": "skills/two/SKILL.md", "type": "blob"},
+    ]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "git/trees" in url:
+            return httpx.Response(200, json=tree)
+        return httpx.Response(200, json={"default_branch": "main"})
+
+    async with mock_client(handler) as client:
+        with pytest.raises(SkillInstallError) as exc_info:
+            await fetch_skill_sources("o/r/does-not-exist", client)
+
+    message = str(exc_info.value)
+    assert "does-not-exist" in message
+    assert "one" in message
+    assert "two" in message
 
 
 async def test_fetch_repo_with_no_skill_md_raises():
@@ -366,18 +450,54 @@ async def test_fetch_repo_dedupes_the_same_skill_shipped_under_two_paths():
         return httpx.Response(200, text=VALID_SKILL)
 
     async with mock_client(handler) as client:
-        sources = await fetch_skill_sources("o/r", client)
+        result = await fetch_skill_sources("o/r", client)
 
-    names = [s.name for s in sources]
+    names = [s.name for s in result.sources]
     assert len(names) == len(set(names)) == 6  # 12 paths in, 6 unique targets out
     # the shallower `skills/<name>/` copy wins over `.openclaw/skills/<name>/`
-    assert all("/skills/" in s.raw_url and "/.openclaw/" not in s.raw_url for s in sources)
+    assert all("/skills/" in s.raw_url and "/.openclaw/" not in s.raw_url for s in result.sources)
+    assert result.skipped == []
 
 
-async def test_fetch_repo_raises_on_a_genuine_equal_depth_collision():
+async def test_fetch_repo_skips_a_genuine_equal_depth_collision_without_failing_the_rest():
     """Two paths at the same depth resolving to the same name is a real
-    ambiguity (which one is "the" skill?), not a canonical-copy pick -- must
-    be reported, never resolved by guessing."""
+    ambiguity (which one is "the" skill?) -- but this must be non-fatal for a
+    collection install: the reported bug had exactly one such tie among 345
+    skills, and the old code raised here, installing zero of the 345.
+    """
+    tree = {"tree": [
+        {"path": "docs/x/SKILL.md", "type": "blob"},
+        {"path": "examples/x/SKILL.md", "type": "blob"},
+        {"path": "skills/y/SKILL.md", "type": "blob"},
+    ]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "git/trees" in url:
+            return httpx.Response(200, json=tree)
+        if url.startswith("https://api.github.com/repos/o/r"):
+            return httpx.Response(200, json={"default_branch": "main"})
+        return httpx.Response(200, text=VALID_SKILL)
+
+    async with mock_client(handler) as client:
+        result = await fetch_skill_sources("o/r", client)
+
+    # 'y' installs fine even though 'x' is ambiguous.
+    assert {s.name for s in result.sources} == {"y"}
+    assert len(result.skipped) == 1
+    skipped_name, commands = result.skipped[0]
+    assert skipped_name == "x"
+    assert any("docs/x/SKILL.md" in c for c in commands)
+    assert any("examples/x/SKILL.md" in c for c in commands)
+    # ready-to-run commands, not bare paths (bug: a vague "install by raw URL"
+    # message with no actual URL sent the model guessing three 404s).
+    assert all(c.startswith("tl skills add https://raw.githubusercontent.com/") for c in commands)
+
+
+async def test_fetch_owner_repo_skill_name_selects_one_ambiguous_skill_as_a_hard_error():
+    """The same 'x' ambiguity as above, but asked for directly by name
+    (`owner/repo/x`) -- here it must be fatal, since there is a real choice
+    for the caller to make instead of 344 other skills to fall back on."""
     tree = {"tree": [
         {"path": "docs/x/SKILL.md", "type": "blob"},
         {"path": "examples/x/SKILL.md", "type": "blob"},
@@ -391,7 +511,7 @@ async def test_fetch_repo_raises_on_a_genuine_equal_depth_collision():
 
     async with mock_client(handler) as client:
         with pytest.raises(SkillInstallError) as exc_info:
-            await fetch_skill_sources("o/r", client)
+            await fetch_skill_sources("o/r/x", client)
 
     assert "docs/x/SKILL.md" in str(exc_info.value)
     assert "examples/x/SKILL.md" in str(exc_info.value)
@@ -400,9 +520,10 @@ async def test_fetch_repo_raises_on_a_genuine_equal_depth_collision():
 def test_installing_the_deduped_set_never_writes_the_same_target_twice(project):
     tree = _ponytail_tree()
     paths = sorted(item["path"] for item in tree["tree"])
-    winners = skills_install._dedupe_skill_paths(paths)
+    winners, skipped = skills_install._dedupe_skill_paths(paths)
 
     assert len(winners) == 6
+    assert skipped == []
     for path in winners:
         name = skills_install._name_from_path(path)
         content = f"---\nname: {name}\ndescription: a {name} skill\n---\nbody\n"
@@ -435,7 +556,7 @@ def test_yes_installs_every_source_in_a_collection_without_prompting(settings, m
     ]
 
     async def fake_fetch(_source, _client):
-        return sources
+        return SkillFetchResult(sources=sources, skipped=[])
 
     monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
 
@@ -467,7 +588,7 @@ def test_collection_selector_prompt_exits_cleanly_on_eof(settings, monkeypatch, 
     ]
 
     async def fake_fetch(_source, _client):
-        return sources
+        return SkillFetchResult(sources=sources, skipped=[])
 
     monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
 
@@ -484,7 +605,7 @@ def test_single_skill_confirmation_prompt_exits_cleanly_on_eof(settings, monkeyp
     source = SkillSource(name="one", raw_url="https://example/one/SKILL.md", content=VALID_SKILL)
 
     async def fake_fetch(_source, _client):
-        return [source]
+        return SkillFetchResult(sources=[source], skipped=[])
 
     monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
 
@@ -521,3 +642,222 @@ def test_import_selector_prompt_exits_cleanly_on_eof(settings, monkeypatch, caps
 
     assert exc_info.value.code == 1
     assert "no input available" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# `tl skills add` on a collection reports skipped ambiguous names with
+# ready-to-run commands, and still installs everything else
+# --------------------------------------------------------------------------
+
+
+def test_cmd_skills_add_reports_skipped_ambiguous_names_and_installs_the_rest(
+    settings, monkeypatch
+):
+    _no_input_allowed(monkeypatch)
+    sources = [
+        SkillSource(name="two", raw_url="https://example/two/SKILL.md",
+                    content="---\nname: two\ndescription: skill two\n---\nbody\n"),
+    ]
+    skipped = [("one", [
+        "tl skills add https://raw.githubusercontent.com/o/r/main/docs/one/SKILL.md",
+        "tl skills add https://raw.githubusercontent.com/o/r/main/examples/one/SKILL.md",
+    ])]
+
+    async def fake_fetch(_source, _client):
+        return SkillFetchResult(sources=sources, skipped=skipped)
+
+    monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
+
+    args = argparse.Namespace(source="o/r", user=False, yes=True)
+    rc = _cmd_skills_add(settings, args, settings.project_root)
+
+    assert rc == 0
+    assert "two" in load_skills(settings.project_root)
+
+
+def test_cmd_skills_add_prints_skipped_names_as_runnable_commands(settings, monkeypatch, capsys):
+    _no_input_allowed(monkeypatch)
+    skipped = [("one", [
+        "tl skills add https://raw.githubusercontent.com/o/r/main/docs/one/SKILL.md",
+        "tl skills add https://raw.githubusercontent.com/o/r/main/examples/one/SKILL.md",
+    ])]
+
+    async def fake_fetch(_source, _client):
+        return SkillFetchResult(sources=[], skipped=skipped)
+
+    monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
+
+    args = argparse.Namespace(source="o/r", user=False, yes=True)
+    rc = _cmd_skills_add(settings, args, settings.project_root)
+
+    err = capsys.readouterr().err
+    assert rc == 1  # nothing installed
+    assert "one" in err
+    # the actual candidate raw-URL commands must be printed, not a vague
+    # "install by raw URL" -- that vagueness is what caused three 404 guesses
+    # in the reported session.
+    assert "tl skills add https://raw.githubusercontent.com/o/r/main/docs/one/SKILL.md" in err
+    assert "tl skills add https://raw.githubusercontent.com/o/r/main/examples/one/SKILL.md" in err
+
+
+def test_cmd_skills_add_caps_content_validation_skip_messages(settings, monkeypatch, capsys):
+    """The same console-flood defect as ambiguity/install reporting, on a third
+    trigger: a repo can front-load many skills that all fail
+    `validate_skill_content` identically (the real repo's dot-mirrored meta
+    files, e.g. README/TEMPLATE with no `description`). Each failure used to
+    print its full multi-line explanation -- 96 times, unbounded -- instead of
+    routing through the same `_CONSOLE_PREVIEW_LIMIT` cap as everything else.
+    """
+    _no_input_allowed(monkeypatch)
+    bad = [
+        SkillSource(name=f"bad-{i}", raw_url=f"https://example/bad-{i}/SKILL.md",
+                    content=f"---\nname: bad-{i}\n---\nno description\n")
+        for i in range(20)
+    ]
+    good = SkillSource(name="good", raw_url="https://example/good/SKILL.md",
+                        content="---\nname: good\ndescription: a good skill\n---\nbody\n")
+
+    async def fake_fetch(_source, _client):
+        return SkillFetchResult(sources=[*bad, good], skipped=[])
+
+    monkeypatch.setattr(skills_install, "fetch_skill_sources", fake_fetch)
+
+    args = argparse.Namespace(source="o/r", user=False, yes=True)
+    rc = _cmd_skills_add(settings, args, settings.project_root)
+
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "good" in load_skills(settings.project_root)
+    assert err.count("no `description`") == 5  # capped, not one per failure
+    assert "...and 15 more skipped (failed validation)" in err
+
+
+# --------------------------------------------------------------------------
+# concurrent fetch (bug: serial round-trips for ~18 skills blew the 120s
+# tool-call timeout) preserves deterministic output order regardless of which
+# request happens to complete first
+# --------------------------------------------------------------------------
+
+
+async def test_fetch_repo_collection_is_concurrent_and_keeps_deterministic_order():
+    """Sleeps are assigned in *reverse* of request order -- the first path
+    requested finishes last -- so a naive "assemble in completion order"
+    implementation would come back scrambled. Output must still match
+    `winners`' sorted order regardless."""
+    import anyio as anyio_test
+
+    names = [f"skill-{i:02d}" for i in range(20)]
+    tree = {"tree": [{"path": f"skills/{n}/SKILL.md", "type": "blob"} for n in names]}
+    completion_order: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "git/trees" in url:
+            return httpx.Response(200, json=tree)
+        if url.startswith("https://api.github.com/repos/o/r"):
+            return httpx.Response(200, json={"default_branch": "main"})
+        name = url.rsplit("/", 2)[-2]
+        idx = names.index(name)
+        await anyio_test.sleep((len(names) - idx) * 0.001)  # reversed vs. request order
+        completion_order.append(name)
+        return httpx.Response(200, text=f"---\nname: {name}\ndescription: d\n---\nbody\n")
+
+    async with mock_client(handler) as client:
+        result = await fetch_skill_sources("o/r", client)
+
+    assert [s.name for s in result.sources] == sorted(names)  # output order is deterministic
+    assert len(completion_order) == 20
+    assert completion_order != sorted(names)  # sanity: completion really was out of order
+
+
+# --------------------------------------------------------------------------
+# live tests -- hit real GitHub repos from the session that reported these
+# bugs. Deselected by default (`-m 'not live'`); run explicitly with
+# `pytest -m live`.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.live
+async def test_live_anthropics_skills_collection_install_completes(tmp_path):
+    """`tl skills add anthropics/skills` -- 18 skills nested under category
+    directories. The reported bug: serial fetches blew the 120s tool-call
+    timeout partway through. This must complete at all."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        result = await fetch_skill_sources("anthropics/skills", client)
+
+    assert len(result.sources) >= 15  # ~18 at time of writing; tolerate repo growth
+    assert len(result.sources) == len(set(s.name for s in result.sources))
+
+
+@pytest.mark.live
+async def test_live_anthropics_skills_three_segment_form_resolves_one_real_skill():
+    """The exact shorthand tried (and failed) three times in the reported
+    session: `owner/repo/<skill-name>` for one skill nested under a category
+    directory."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        collection = await fetch_skill_sources("anthropics/skills", client)
+        assert collection.sources, "need at least one real skill name to target"
+        target = collection.sources[0].name
+
+        result = await fetch_skill_sources(f"anthropics/skills/{target}", client)
+
+    assert len(result.sources) == 1
+    assert result.sources[0].name == target
+
+
+@pytest.mark.live
+async def test_live_anthropics_skills_bogus_name_lists_real_available_names():
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        with pytest.raises(SkillInstallError) as exc_info:
+            await fetch_skill_sources("anthropics/skills/definitely-not-a-real-skill-xyz", client)
+
+    message = str(exc_info.value)
+    assert "definitely-not-a-real-skill-xyz" in message
+    assert "Available" in message
+
+
+@pytest.mark.live
+async def test_live_alirezarezvani_claude_skills_collection_installs_and_skips_the_real_ambiguity():
+    """The reported ambiguity: `ab-test-setup` ships at two equally-plausible
+    paths (`.gemini/skills/ab-test-setup/SKILL.md` and
+    `marketing-skill/skills/ab-test-setup/SKILL.md`, both depth 2 -- verified
+    live at the time this test was written). But this whole repo mirrors its
+    entire tree under `.gemini/skills/<name>/` at that same depth, so
+    depth-only tie-breaking made nearly everything "ambiguous" (installed 5
+    of ~340 when driven through the real CLI) -- the actual fix is that a
+    dot-prefixed directory is never the canonical copy, so `ab-test-setup`
+    now resolves to its real `marketing-skill/...` source and is **not**
+    skipped at all.
+
+    What remains genuinely ambiguous (verified live: `handoff`, `init`, `run`,
+    `status` -- two different non-mirror category directories shipping the
+    same generic name, e.g. `engineering/agenthub/skills/run/SKILL.md` vs
+    `engineering/autoresearch-agent/skills/run/SKILL.md`) still must be
+    skipped, not silently guessed, and still must not block the rest.
+
+    Bounds are deliberately loose -- this repo's contents can change over
+    time; what must hold is "the vast majority installs, the dot-prefixed
+    mirror never wins over a canonical path, and a real non-mirror tie is
+    still reported rather than resolved by guessing."
+    """
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        result = await fetch_skill_sources("alirezarezvani/claude-skills", client)
+
+    assert len(result.sources) > 400  # observed 435; the old depth-only rule gave 5 via the CLI
+    by_name = {s.name: s for s in result.sources}
+    assert "ab-test-setup" in by_name
+    assert "ab-test-setup" not in {name for name, _commands in result.skipped}
+
+    # the dot-prefixed mirror must never win *when a non-mirror copy exists* --
+    # `ab-test-setup` ships at both `.gemini/skills/ab-test-setup/SKILL.md` and
+    # `marketing-skill/skills/ab-test-setup/SKILL.md`; the real one must win.
+    # (Some names -- e.g. this repo's top-level `README` -- exist *only* under
+    # a dot-prefixed mirror with no other copy anywhere, so a blanket "no
+    # installed path is ever dot-prefixed" assertion would be wrong; the rule
+    # is "prefer non-mirror when one exists", not "refuse mirrors outright".)
+    assert "/.gemini/" not in by_name["ab-test-setup"].raw_url
+    assert "marketing-skill/" in by_name["ab-test-setup"].raw_url
+
+    # a genuine, non-mirror tie is still reported, not silently resolved.
+    skipped_names = {name for name, _commands in result.skipped}
+    assert skipped_names  # some real ties remain in this repo (verified live: handoff/init/run/status)

@@ -134,7 +134,8 @@ Run a shell command.
 Arguments:
 - `command`: the command line to execute.
 - `description`: a short phrase shown to the user while it runs.
-- `timeout_ms`: default 120000, maximum 600000.
+- `timeout_ms`: default 300000, maximum 600000. Raise it for a command you expect
+  to run long rather than letting it time out and retrying unchanged.
 - `run_in_background`: return a handle immediately instead of waiting.
 
 Tool selection:
@@ -268,8 +269,18 @@ it times out.
         )
 
         if timed_out:
+            # A bare "timed out after Ns" tells the model nothing it can act on: it
+            # either gives up or blindly re-issues the identical command (same class
+            # of problem as the permanent-deny loop in runner.py, which once burned
+            # 233k input tokens retrying a call that could never succeed). Naming the
+            # limit that was actually applied and the parameter that raises it gives
+            # the model something to change on the next call instead of repeating it.
             body += (
-                f"\n\n[timed out after {timeout_ms / 1000:.0f}s; the process tree was killed]"
+                f"\n\n[timed out after {timeout_ms / 1000:.0f}s; the process tree was killed. "
+                f"This is timeout_ms ({'the default' if args.timeout_ms is None else 'as given'}, "
+                f"{timeout_ms}ms) — pass a higher timeout_ms (up to {cfg.max_timeout_ms}ms) if the "
+                "command legitimately needs more time. Retrying the same call unchanged will "
+                "time out the same way.]"
             )
         elif exit_code:
             body += f"\n\n[exit code: {exit_code}]"

@@ -67,6 +67,40 @@ def test_build_system_omits_config_layout_in_minimal_variant():
     assert not any("turnloop's own configuration" in s for s in segments)
 
 
+def test_config_layout_tells_the_model_mcp_tools_are_ordinary_tools():
+    # The incident: the model was asked to "use playwright mcp to verify" and, with
+    # nothing in the prompt about MCP, shelled out to `playwright mcp verify` and
+    # `playwright test` — both nonsense. The fix is prompt guidance, not code.
+    lower = CONFIG_LAYOUT.lower()
+    assert "mcp" in lower
+    assert "never shell out" in lower or "do not shell out" in lower
+    assert "/mcp add" in CONFIG_LAYOUT or "tl mcp" in CONFIG_LAYOUT
+
+
+def test_environment_segment_lists_configured_mcp_servers():
+    from turnloop.agent.system_prompt import environment_segment
+    from turnloop.providers.base import Capabilities
+
+    settings = default_settings()
+    settings.project_root = Path("/some/project")
+    settings.mcp_servers = {}
+    segment = environment_segment(Path("/some/project"), settings, Capabilities())
+    assert "none configured" in segment
+
+
+def test_environment_segment_names_a_configured_mcp_server():
+    from turnloop.agent.system_prompt import environment_segment
+    from turnloop.config import MCPServerConfig
+    from turnloop.providers.base import Capabilities
+
+    settings = default_settings()
+    settings.project_root = Path("/some/project")
+    settings.mcp_servers = {"playwright": MCPServerConfig(command="npx", args=["mcp-playwright"])}
+    segment = environment_segment(Path("/some/project"), settings, Capabilities())
+    assert "playwright" in segment
+    assert "none configured" not in segment
+
+
 def test_config_layout_skills_example_is_real_yaml_that_actually_parses():
     # A model once wrote frontmatter as markdown bold ("**description**: ...")
     # instead of YAML, and the skill silently vanished (yaml.safe_load gives

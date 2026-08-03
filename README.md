@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~20,000 lines of Python, 346 tests, no network in the default test run.
+~21,500 lines of Python, 364 tests, no network in the default test run.
 
 ---
 
@@ -88,7 +88,7 @@ point.
 Verify:
 
 ```bash
-tl --version                # turnloop 0.1.8
+tl --version                # turnloop 0.1.10
 tl doctor                   # every provider, key presence, shell, context budget
 ```
 
@@ -994,7 +994,7 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 346 tests, no network
+pytest                    # 364 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
@@ -1008,7 +1008,7 @@ mypy turnloop
 | `test_hooks_mcp_commands.py` | 28 | lifecycle hooks, MCP client, slash commands |
 | `test_tui.py` | 25 | Textual snapshots, `/config` and `/mcp add` driven through a real app |
 | `test_config.py` | 23 | layering, env overrides, presets, narrow-console guard |
-| `test_skills_install.py` | 27 | frontmatter validation, GitHub resolution, path dedupe, EOF on every prompt, drive-root refusal |
+| `test_skills_install.py` | 39 | frontmatter validation, GitHub resolution, agent-mirror tiebreak, concurrent fetch ordering, console caps, EOF on every prompt, drive-root refusal |
 | `test_loop.py` | 23 | streaming, truncation, iteration cap |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
 | `test_configio.py` | 15 | minimal-diff writes, atomic save, secret-bearing MCP targets, the settings deny rules |
@@ -1063,11 +1063,19 @@ in the system prompt and load their body on demand, which on a 65k window is the
 difference between having skills and not.
 
 The system prompt also documents this layout to the model itself, as `CONFIG_LAYOUT`
-— 326 tokens, in the cacheable region, omitted from the `minimal` variant. Without it
+— 432 tokens, in the cacheable region, omitted from the `minimal` variant. Without it
 the model cannot configure the tool it is running inside: asked to add an MCP server
 it invented `.turnloop/turnloop.config.json`, and asked to install a skill it wrote to
 `examples/` — both real outputs from live runs. With it, both go to the right place
-first try. It includes the literal YAML frontmatter a skill needs, since a skill with
+first try.
+
+It also names `tl skills add` explicitly and tells the model *not* to run the install
+scripts skill repos publish for other agents. That paragraph was added after watching
+three separate sessions try `/plugin marketplace add` as a shell command, then
+`clawhub install`, then `git clone` plus `npm install` plus `npm test` — twenty-six
+messages ending in "the ponytail skill has been installed", when nothing had been put
+anywhere turnloop looks. The same request now costs 11,090 tokens and answers
+`tl skills add DietrichGebert/ponytail`. It includes the literal YAML frontmatter a skill needs, since a skill with
 markdown-bold frontmatter instead of YAML used to vanish with no diagnostic; `/skills`
 now also reports anything found on disk but rejected, with the reason and path — see
 [Bugs worth reading about](#bugs-worth-reading-about).
