@@ -9,12 +9,18 @@ the same technique httpx's own docs recommend for offline tests.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
+import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import httpx
 import pytest
 
+import turnloop.cli as cli
 import turnloop.skills_install as skills_install
 from turnloop.cli import _cmd_skills_add, _cmd_skills_import, _cmd_skills_remove
 from turnloop.commands.loader import load_skills
@@ -572,11 +578,21 @@ def test_yes_installs_every_source_in_a_collection_without_prompting(settings, m
 # --------------------------------------------------------------------------
 
 
+class _FakeTTYStdin:
+    """isatty() True, so `_prompt` proceeds to call `input()` -- covers the
+    remaining case the EOFError catch exists for: a terminal that reports
+    itself as interactive but still hits EOF (e.g. closed mid-session)."""
+
+    def isatty(self) -> bool:
+        return True
+
+
 def _raise_eof(monkeypatch):
     def _boom(*_args, **_kwargs):
         raise EOFError()
 
     monkeypatch.setattr("builtins.input", _boom)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeTTYStdin())
 
 
 def test_collection_selector_prompt_exits_cleanly_on_eof(settings, monkeypatch, capsys):
@@ -642,6 +658,198 @@ def test_import_selector_prompt_exits_cleanly_on_eof(settings, monkeypatch, caps
 
     assert exc_info.value.code == 1
     assert "no input available" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# the actual deadlock: a non-interactive invocation whose stdin is neither
+# closed nor a terminal -- exactly what the Bash tool hands a child process.
+# `input()` never raises EOFError there because no EOF ever arrives; the old
+# `_prompt` only caught EOFError, so it blocked forever until an external
+# timeout killed the process tree (the real session: 300s, then a 600s retry).
+# --------------------------------------------------------------------------
+
+
+class _FakeNonTTYStdin:
+    def isatty(self) -> bool:
+        return False
+
+
+def test_prompt_refuses_a_non_tty_stdin_without_ever_calling_input(monkeypatch, capsys):
+    """`isatty() is False` must refuse immediately -- this is the case an open,
+    never-written pipe hits, which is NOT covered by the EOFError catch alone."""
+    _no_input_allowed(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeNonTTYStdin())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._prompt("install this skill? [y/N] ")
+
+    assert exc_info.value.code == 1
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_prompt_refuses_when_stdin_is_none(monkeypatch, capsys):
+    """pythonw and some subprocess setups give a process no stdin object at
+    all (`sys.stdin is None`) rather than a closed or non-tty one -- `.isatty()`
+    would raise AttributeError on that, so it must be guarded explicitly."""
+    _no_input_allowed(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._prompt("install this skill? [y/N] ")
+
+    assert exc_info.value.code == 1
+    assert "--yes" in capsys.readouterr().err
+
+
+def _serve_one_skill_md(content: str) -> tuple[threading.Thread, str, http.server.HTTPServer]:
+    """A local, offline stand-in for a "raw file" skill source (the branch in
+    `fetch_skill_sources` that treats an unrecognized URL as a direct SKILL.md).
+    Real localhost network, no external calls -- deterministic and fast."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = content.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):  # silence per-request console spam
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    return thread, f"http://127.0.0.1:{port}/SKILL.md", server
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _subprocess_env() -> dict:
+    """`os.environ`, plus a `PYTHONPATH` that forces `-m turnloop.cli` to load
+    *this* checkout rather than whatever `turnloop` happens to be pip-installed
+    into the interpreter's site-packages.
+
+    `python -m turnloop.cli` resolves `turnloop` by normal import machinery,
+    which checks the current working directory before `PYTHONPATH` and
+    site-packages -- but these tests intentionally run with `cwd` set to a
+    throwaway project directory (to reproduce `find_project_root` acting on a
+    real cwd), not this repo root. Without `PYTHONPATH` pointing here, a
+    non-editable `pip install turnloop` sitting in site-packages silently wins
+    instead, and the subprocess exercises old, already-published code -- not
+    the fix under test. (Verified on this machine: a stale 0.1.10 install
+    without this fix was exactly what got picked up before this was added,
+    which is why the first version of this test could not have failed against
+    unfixed code no matter what it asserted.)
+    """
+    return {**os.environ, "PYTHONPATH": str(_REPO_ROOT)}
+
+
+def test_real_subprocess_with_an_open_never_written_stdin_pipe_exits_promptly_instead_of_hanging(
+    tmp_path,
+):
+    """The exact reproduction from the reported session, at the process level.
+
+    `subprocess.Popen(..., stdin=subprocess.PIPE)` with nothing ever written to
+    or closed on that pipe is precisely what the Bash tool hands a child: an
+    open, live pipe with no writer. A test using closed stdin or `/dev/null`
+    would have passed against the old, broken `_prompt` (EOFError fires
+    instantly for those) -- it would NOT have caught this bug. Only an open,
+    unwritten pipe reproduces the hang, so that is what this uses, with a hard
+    wall-clock timeout that fails the test if the old deadlock recurs.
+
+    Critically, this does NOT use `Popen.communicate()`: that method closes
+    stdin itself when called with no `input=`, which would silently turn this
+    back into the already-working closed-stdin case and defeat the whole
+    point of the test. `wait()` is used instead, with the pipe left open the
+    entire time, exactly as the Bash tool leaves it.
+    """
+    thread, url, server = _serve_one_skill_md(VALID_SKILL)
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / ".turnloop").mkdir()
+
+        # Deliberately does NOT override HOME/USERPROFILE: `find_project_root`
+        # excludes the real home directory from its declared-`.turnloop` pass
+        # specifically so an ancestor's config never gets mistaken for this
+        # project's (config.py's `find_project_root` docstring). Faking HOME to
+        # a tmp dir instead defeats that exclusion, because pytest's own
+        # `tmp_path` lives *under* the real home directory on this machine --
+        # that combination is what wrote a stray skill into the real
+        # `~/.turnloop/skills` the first time this test was written. Leaving
+        # HOME real keeps the exclusion working and confines the install to
+        # `project`, which is asserted below.
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "turnloop.cli", "skills", "add", url],
+            cwd=project,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_subprocess_env(),
+            text=True,
+        )
+        try:
+            proc.wait(timeout=10)
+            hung = False
+        except subprocess.TimeoutExpired:
+            hung = True
+            proc.kill()
+            proc.wait()
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+        proc.stdin.close()
+
+        assert not hung, (
+            "tl skills add hung on an open, never-written stdin pipe -- "
+            f"the deadlock this fix targets is back. stdout={stdout!r} stderr={stderr!r}"
+        )
+        assert proc.returncode == 1, f"stdout={stdout!r} stderr={stderr!r}"
+        assert "--yes" in stderr
+        assert not (project / ".turnloop" / "skills").exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_real_subprocess_with_yes_installs_non_interactively_from_the_same_pipe(tmp_path):
+    """The consent gate itself must still work: `--yes` on the identical
+    open-pipe stdin must install rather than being auto-confirmed by the
+    non-tty check alone -- the fix must not turn into "always allow"."""
+    thread, url, server = _serve_one_skill_md(VALID_SKILL)
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / ".turnloop").mkdir()
+
+        # See the sibling test above for why HOME/USERPROFILE are left real.
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "turnloop.cli", "skills", "add", url, "--yes"],
+            cwd=project,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_subprocess_env(),
+            text=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            pytest.fail("tl skills add --yes hung -- should never touch stdin at all")
+
+        assert proc.returncode == 0, f"stdout={stdout!r} stderr={stderr!r}"
+        assert (project / ".turnloop" / "skills" / "demo" / "SKILL.md").exists(), (
+            f"stdout={stdout!r} stderr={stderr!r} "
+            f"tree={list(project.rglob('*'))}"
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 # --------------------------------------------------------------------------

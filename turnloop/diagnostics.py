@@ -100,7 +100,7 @@ def _tooling_rows() -> list[tuple[str, str, str]]:
 
 
 def _provider_rows(settings: Settings) -> list[tuple[str, str, str]]:
-    import os
+    from turnloop.providers.registry import resolve_api_keys
 
     rows: list[tuple[str, str, str]] = []
     active = settings.provider
@@ -110,8 +110,10 @@ def _provider_rows(settings: Settings) -> list[tuple[str, str, str]]:
         detail = f"{cfg.kind} {cfg.model}"
 
         if cfg.api_key_env:
-            if os.environ.get(cfg.api_key_env):
-                detail += f", {cfg.api_key_env} set"
+            keys = resolve_api_keys(cfg.api_key_env)
+            if keys:
+                suffix = f" ({len(keys)} keys)" if len(keys) > 1 else ""
+                detail += f", {cfg.api_key_env} set{suffix}"
                 status = OK
             else:
                 detail += f", {cfg.api_key_env} NOT set"

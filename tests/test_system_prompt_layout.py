@@ -101,6 +101,15 @@ def test_environment_segment_names_a_configured_mcp_server():
     assert "none configured" not in segment
 
 
+def test_config_layout_tells_the_model_non_interactive_install_needs_yes():
+    # The deadlock this was added for: the model's Bash tool is always
+    # non-interactive, and `tl skills add` used to block forever on a
+    # confirmation prompt nobody could answer (cli.py's `_prompt`). The prompt
+    # must tell the model to pass `--yes` up front, instead of letting it
+    # discover the hang the hard way.
+    assert "--yes" in CONFIG_LAYOUT
+
+
 def test_config_layout_skills_example_is_real_yaml_that_actually_parses():
     # A model once wrote frontmatter as markdown bold ("**description**: ...")
     # instead of YAML, and the skill silently vanished (yaml.safe_load gives

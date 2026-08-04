@@ -570,3 +570,172 @@ def test_gemini_schema_strips_defs_and_additional_properties():
     assert "additionalProperties" not in rendered
     # The inlined nested model must survive the stripping.
     assert "old_string" in rendered
+
+
+# --------------------------------------------------------------------------
+# multi-key failover
+# --------------------------------------------------------------------------
+
+
+def test_resolve_api_keys_reads_only_the_base_name(monkeypatch):
+    from turnloop.providers.registry import resolve_api_keys
+
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+    monkeypatch.setenv("FAKE_KEY", "k1")
+    assert resolve_api_keys("FAKE_KEY") == ["k1"]
+
+
+def test_resolve_api_keys_reads_numbered_siblings_in_order(monkeypatch):
+    from turnloop.providers.registry import resolve_api_keys
+
+    monkeypatch.setenv("FAKE_KEY", "k1")
+    monkeypatch.setenv("FAKE_KEY_1", "k2")
+    monkeypatch.setenv("FAKE_KEY_2", "k3")
+    assert resolve_api_keys("FAKE_KEY") == ["k1", "k2", "k3"]
+
+
+def test_resolve_api_keys_tolerates_gaps(monkeypatch):
+    from turnloop.providers.registry import resolve_api_keys
+
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+    monkeypatch.delenv("FAKE_KEY_1", raising=False)
+    monkeypatch.setenv("FAKE_KEY_3", "k3")
+    assert resolve_api_keys("FAKE_KEY") == ["k3"]
+
+
+def test_resolve_api_keys_dedupes_identical_values(monkeypatch):
+    """A copy-pasted duplicate must not create a phantom fallback."""
+    from turnloop.providers.registry import resolve_api_keys
+
+    monkeypatch.setenv("FAKE_KEY", "k1")
+    monkeypatch.setenv("FAKE_KEY_1", "k1")
+    monkeypatch.setenv("FAKE_KEY_2", "k2")
+    assert resolve_api_keys("FAKE_KEY") == ["k1", "k2"]
+
+
+def test_resolve_api_keys_empty_when_nothing_set(monkeypatch):
+    from turnloop.providers.registry import resolve_api_keys
+
+    for suffix in ("", *(f"_{i}" for i in range(1, 21))):
+        monkeypatch.delenv(f"FAKE_KEY{suffix}", raising=False)
+    assert resolve_api_keys("FAKE_KEY") == []
+
+
+def _multi_key_provider(keys: list[str]) -> OpenAICompatProvider:
+    return OpenAICompatProvider(
+        name="glm",
+        model="glm-5.2",
+        caps=Capabilities(max_context=65_536),
+        base_url="http://test/v1",
+        api_keys=keys,
+    )
+
+
+async def test_a_429_rotates_to_the_next_key_without_sleeping(monkeypatch):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("turnloop.providers.base._sleep", fake_sleep)
+
+    success = (FIXTURES / "glm_tool_call.sse").read_text()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, content=b'{"error":"rate limited"}')
+        return httpx.Response(
+            200, content=success.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    provider = _multi_key_provider(["k1", "k2"])
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    events = [e async for e in provider.stream(CompletionRequest(messages=[]))]
+
+    assert any(isinstance(e, MessageDone) for e in events)
+    assert provider.api_key == "k2"
+    assert slept == [], "rotating to a fresh key must not consume the backoff path"
+
+
+async def test_a_401_rotates_to_the_next_key(monkeypatch):
+    success = (FIXTURES / "glm_tool_call.sse").read_text()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(401, content=b'{"error":"bad key"}')
+        return httpx.Response(
+            200, content=success.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    provider = _multi_key_provider(["k1", "k2"])
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    events = [e async for e in provider.stream(CompletionRequest(messages=[]))]
+
+    assert any(isinstance(e, MessageDone) for e in events)
+    assert provider.api_key == "k2"
+
+
+async def test_every_key_rate_limited_still_falls_back_to_backoff_and_raises(monkeypatch):
+    """Rotation is exhausted after one pass per key, so the turn cannot loop forever."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("turnloop.providers.base._sleep", fake_sleep)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, content=b'{"error":"rate limited"}')
+
+    provider = _multi_key_provider(["k1", "k2"])
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider.max_retries = 1
+
+    from turnloop.errors import RetryableProviderError
+
+    with pytest.raises(RetryableProviderError):
+        async for _ in provider.stream(CompletionRequest(messages=[])):
+            pass
+
+    # One rotation (k1 -> k2), then the normal backoff/attempt-counting path
+    # takes over and eventually exhausts max_retries.
+    assert calls["n"] > 2
+    assert slept, "the backoff path must still run once rotation is exhausted"
+
+
+async def test_single_key_429_still_uses_backoff(monkeypatch):
+    """No second key means the old behavior — sleep and retry — is unchanged."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("turnloop.providers.base._sleep", fake_sleep)
+
+    success = (FIXTURES / "glm_tool_call.sse").read_text()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, content=b'{"error":"rate limited"}')
+        return httpx.Response(
+            200, content=success.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    provider = _multi_key_provider(["k1"])
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    events = [e async for e in provider.stream(CompletionRequest(messages=[]))]
+
+    assert any(isinstance(e, MessageDone) for e in events)
+    assert slept, "single key must still go through backoff, not rotation"

@@ -36,15 +36,20 @@ def build_provider(name: str, cfg) -> Provider:
             f"(expected one of {', '.join(sorted(_KINDS))})"
         )
 
-    api_key = cfg.api_key or ""
-    if cfg.api_key_env:
-        api_key = os.environ.get(cfg.api_key_env, "") or api_key
-        if not api_key and cfg.kind != "openai_compat":
-            # An OpenAI-compatible endpoint may legitimately be unauthenticated
-            # (vLLM on Modal is), so only hosted APIs hard-fail here.
-            raise ConfigError(
-                f"provider '{name}': environment variable {cfg.api_key_env} is not set"
-            )
+    # Env-derived keys (GROQ_API_KEY, GROQ_API_KEY_1, ...) take precedence over
+    # the literal cfg.api_key, matching the old single-key precedence exactly.
+    api_keys = resolve_api_keys(cfg.api_key_env) if cfg.api_key_env else []
+    if not api_keys and cfg.api_key:
+        api_keys = [cfg.api_key]
+    api_key = api_keys[0] if api_keys else ""
+
+    if cfg.api_key_env and not api_keys and cfg.kind != "openai_compat":
+        # An OpenAI-compatible endpoint may legitimately be unauthenticated
+        # (vLLM on Modal is), so only hosted APIs hard-fail here.
+        raise ConfigError(
+            f"provider '{name}': environment variable {cfg.api_key_env} is not set "
+            "(a numbered form such as GROQ_API_KEY_1 also works)"
+        )
 
     kwargs: dict = {
         "name": name,
@@ -52,6 +57,7 @@ def build_provider(name: str, cfg) -> Provider:
         "caps": cfg.caps,
         "base_url": cfg.base_url,
         "api_key": api_key,
+        "api_keys": api_keys,
         "headers": dict(cfg.headers or {}),
         "timeout_s": cfg.timeout_s,
         "health_url": cfg.health_url,
@@ -73,3 +79,20 @@ def build_provider(name: str, cfg) -> Provider:
 
 def available_kinds() -> list[str]:
     return sorted(_KINDS)
+
+
+def resolve_api_keys(env_name: str) -> list[str]:
+    """`env_name`, then `env_name_1`..`_20`, stripped, deduped, order preserved.
+
+    Free-tier accounts are the reason for the numbered suffixes: a user with
+    three Groq accounts sets GROQ_API_KEY_1/_2/_3 and turnloop rotates through
+    them on 429/401/403 instead of dying on the first exhausted key.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for suffix in ("", *(f"_{i}" for i in range(1, 21))):
+        value = (os.environ.get(f"{env_name}{suffix}") or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            keys.append(value)
+    return keys

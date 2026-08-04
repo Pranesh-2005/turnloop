@@ -20,7 +20,7 @@ tl experiment run smoke         # a measurement run, offline and free
 
 Four runtime dependencies: `textual`, `pydantic`, `httpx`, `pyyaml`. No vendor
 SDKs, no agent framework — the loop is the point, so the loop is written here.
-~21,500 lines of Python, 364 tests, no network in the default test run.
+~21,900 lines of Python, 381 tests, no network in the default test run.
 
 ---
 
@@ -88,7 +88,7 @@ point.
 Verify:
 
 ```bash
-tl --version                # turnloop 0.1.10
+tl --version                # turnloop 0.1.11
 tl doctor                   # every provider, key presence, shell, context budget
 ```
 
@@ -409,6 +409,12 @@ All nine ship preconfigured. `doctor` shows which have keys present.
 | `gemini` | gemini | `gemini-flash-latest` | `GEMINI_API_KEY` | alias, not a pin — see below |
 | `blaxel` | openai_compat | `gpt-4o-mini` | `BL_API_KEY` | sandbox; ignores the model field |
 | `ollama` | openai_compat | `qwen2.5-coder:14b` | none | local |
+
+**Multiple keys per provider.** Free-tier accounts run out fast, so any `*_API_KEY`
+also accepts numbered siblings: `GROQ_API_KEY`, `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, ...
+up to `_20`. On a 429, 401, or 403, turnloop rotates to the next configured key and
+retries the same turn instead of failing it — each key is tried at most once per turn.
+`doctor` reports the count, e.g. `GROQ_API_KEY set (3 keys)`, never the values.
 
 Three provider facts that are configuration rather than capability, each learned from
 a live failure:
@@ -994,7 +1000,7 @@ one-line edit in a CRLF checkout does not produce a whole-file diff.
 ## Testing
 
 ```bash
-pytest                    # 364 tests, no network
+pytest                    # 381 tests, no network
 ruff check turnloop
 mypy turnloop
 ```
@@ -1003,12 +1009,12 @@ mypy turnloop
 |---|---|---|
 | `test_permissions.py` | 50 | rule grammar, compound-command splitting, mode enforcement |
 | `test_experiments.py` | 36 | runner, graders, report, suite invariants, config resolution |
-| `test_providers.py` | 35 | adapters vs recorded `.sse`, image blocks, thought signatures |
+| `test_providers.py` | 44 | adapters vs recorded `.sse`, image blocks, thought signatures, multi-key rotation on 429/401 |
 | `test_tools_files.py` | 28 | Read/Write/Edit/Glob/Grep, encodings, newlines, image detection |
 | `test_hooks_mcp_commands.py` | 28 | lifecycle hooks, MCP client, slash commands |
 | `test_tui.py` | 25 | Textual snapshots, `/config` and `/mcp add` driven through a real app |
 | `test_config.py` | 23 | layering, env overrides, presets, narrow-console guard |
-| `test_skills_install.py` | 39 | frontmatter validation, GitHub resolution, agent-mirror tiebreak, concurrent fetch ordering, console caps, EOF on every prompt, drive-root refusal |
+| `test_skills_install.py` | 43 | frontmatter validation, GitHub resolution, agent-mirror tiebreak, concurrent fetch ordering, console caps, non-TTY refusal on an open stdin pipe, drive-root refusal |
 | `test_loop.py` | 23 | streaming, truncation, iteration cap |
 | `test_compaction.py` | 16 | three tiers, tool_use/tool_result invariant |
 | `test_configio.py` | 15 | minimal-diff writes, atomic save, secret-bearing MCP targets, the settings deny rules |

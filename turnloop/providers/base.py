@@ -164,12 +164,18 @@ class Provider(ABC):
                  base_url: str | None = None, api_key: str = "", headers: dict | None = None,
                  timeout_s: float | None = None, health_url: str | None = None,
                  cold_boot_budget_s: float = 55 * 60, cold_boot_poll_s: float = 10.0,
-                 max_retries: int = 3):
+                 max_retries: int = 3, api_keys: list[str] | None = None):
         self.name = name
         self.model = model
         self.caps = caps
         self.base_url = (base_url or "").rstrip("/")
-        self.api_key = api_key
+        # A user with several free-tier accounts sets KEY, KEY_1, KEY_2 in .env;
+        # self.api_key is the one currently in use and is the only field the
+        # adapters read, so rotating it is all `_rotate_key` needs to do.
+        self._api_keys = list(api_keys) if api_keys else ([api_key] if api_key else [])
+        self._key_index = 0
+        self.api_key = self._api_keys[0] if self._api_keys else api_key
+        self._rotations_left = 0
         self.extra_headers = headers or {}
         self.timeout_s = timeout_s
         self.health_url = health_url
@@ -275,6 +281,22 @@ class Provider(ABC):
             msg += " If this is Modal-hosted, verify the app is actually deployed (not stopped)."
         return msg
 
+    # --- key rotation -------------------------------------------------------
+
+    def _rotate_key(self) -> bool:
+        """Switch to the next configured key. False when none is left to try.
+
+        `_rotations_left` is reset once per `stream()` call so a turn tries
+        each key at most once instead of spinning forever on a permanently
+        dead account.
+        """
+        if len(self._api_keys) < 2 or self._rotations_left <= 0:
+            return False
+        self._rotations_left -= 1
+        self._key_index = (self._key_index + 1) % len(self._api_keys)
+        self.api_key = self._api_keys[self._key_index]
+        return True
+
     # --- the streaming loop -----------------------------------------------
 
     @abstractmethod
@@ -287,6 +309,10 @@ class Provider(ABC):
         async for status in self.preflight():
             yield status
 
+        # One rotation budget per turn: try every configured key at most once
+        # before falling back to backoff, so a dead key can't loop forever.
+        self._rotations_left = max(0, len(self._api_keys) - 1)
+
         attempt = 0
         while True:
             try:
@@ -296,9 +322,33 @@ class Provider(ABC):
                 if self.first_request_at is None:
                     self.first_request_at = self.last_request_at
                 return
-            except FatalProviderError:
+            except FatalProviderError as exc:
+                # 401/403 means this key is dead (expired, revoked) — not that
+                # the request itself is malformed — so a spare key is worth
+                # trying before giving up the whole turn.
+                if exc.status in (401, 403):
+                    old, n = self._key_index, len(self._api_keys)
+                    if self._rotate_key():
+                        yield ProviderStatus(
+                            f"{self.name}: key {old + 1}/{n} rejected — "
+                            f"switching to key {self._key_index + 1}/{n}",
+                            phase="retrying",
+                        )
+                        continue
                 raise
             except RetryableProviderError as exc:
+                # A fresh key beats sleeping out someone else's rate limit —
+                # try that first and only fall back to backoff once every key
+                # has been tried this turn.
+                if exc.status == 429:
+                    old, n = self._key_index, len(self._api_keys)
+                    if self._rotate_key():
+                        yield ProviderStatus(
+                            f"{self.name}: key {old + 1}/{n} rate-limited — "
+                            f"switching to key {self._key_index + 1}/{n}",
+                            phase="retrying",
+                        )
+                        continue
                 attempt += 1
                 if attempt > self.max_retries:
                     raise

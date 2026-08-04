@@ -256,13 +256,24 @@ def _print_skill_target(settings: Settings, user_level: bool, cwd: Path) -> None
 
 
 def _prompt(text: str) -> str:
-    """`input()`, but closed/piped stdin exits cleanly instead of a traceback.
+    """`input()`, but a non-interactive stdin exits cleanly instead of hanging.
 
-    Every confirmation in the skills commands goes through this. Piping stdin
-    from `/dev/null` (or any non-interactive invocation -- CI, a script) hits
-    EOF the instant `input()` reads, which is a normal thing for a CLI to face
-    and not worth a stack trace over.
+    Every confirmation in the skills commands goes through this. Closed/piped
+    stdin (`/dev/null`, CI) hits EOF the instant `input()` reads -- fine,
+    that's the `EOFError` case below. But a session replay showed a second,
+    worse case: the model's Bash tool runs `tl skills add ...` with stdin as
+    an *open* pipe that nobody ever writes to. `isatty()` is false there just
+    like the closed case, but nothing ever raises `EOFError` -- `input()`
+    blocks forever waiting for bytes that will never arrive, and the process
+    only dies when the harness's own timeout kills the tree (300s, then a
+    600s retry, both wasted). Checking `isatty()` up front refuses before
+    that block happens, instead of after it. `sys.stdin` can itself be
+    `None` under pythonw/certain subprocess setups, hence the guard.
     """
+    if sys.stdin is None or not sys.stdin.isatty():
+        print("\nskills: no interactive terminal available -- rerun with --yes "
+              "for non-interactive use", file=sys.stderr)
+        raise SystemExit(1)
     try:
         return input(text)
     except EOFError:

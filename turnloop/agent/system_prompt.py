@@ -116,7 +116,8 @@ Frontmatter is YAML, not markdown, and needs `description` or it is dropped \
   ---
   Installing one is the user's job, not yours: `tl skills add <owner/repo>` \
 fetches and validates a SKILL.md, and `tl skills import` adopts skills already \
-on the machine. Skill repos publish install scripts for other agents \
+on the machine. Non-interactive (your Bash tool) needs `--yes` or it refuses. \
+Skill repos publish install scripts for other agents \
 (`/plugin ...`, `clawhub`, `npm install`) — none of those put anything where \
 turnloop looks, so never run them. Point the user at `tl skills add` instead.
 - MCP tools: once a server above is connected, its tools appear as ordinary \

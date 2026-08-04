@@ -92,6 +92,20 @@ class AgentLoop:
             self.limiter = anyio.CapacityLimiter(
                 max(1, self.provider.caps.max_concurrent_requests)
             )
+        # Populated here rather than by each call site: factory.py built the parent
+        # loop's extras by hand and subagent.py built a second AgentLoop that simply
+        # forgot to, so a subagent's WebFetch had no provider to summarize with and
+        # fell back to dumping raw page chrome at the parent. Every field here is
+        # already a constructor arg, so there is nothing for a caller to get wrong.
+        self._extras.update(
+            {
+                "provider": self.provider,
+                "registry": self.registry,
+                "ui": self.ui,
+                "limiter": self.limiter,
+                "settings": self.settings,
+            }
+        )
 
     # --- public API --------------------------------------------------------
 

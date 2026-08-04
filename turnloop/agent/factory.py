@@ -151,18 +151,11 @@ def create_agent(
         limiter=limiter_for(provider),
     )
 
-    # Tools that need to reach the agent itself (Task spawning a child, WebFetch
-    # summarizing a page) get it through extras rather than through imports, so
-    # the dependency stays one-directional.
-    loop._extras.update(
-        {
-            "provider": provider,
-            "registry": registry,
-            "ui": ui,
-            "limiter": loop.limiter,
-            "settings": settings,
-        }
-    )
+    # Extras (provider/registry/ui/limiter/settings) that let a tool reach back
+    # into the agent (Task spawning a child, WebFetch summarizing a page) are
+    # populated by AgentLoop.__post_init__ itself now — every value is already a
+    # constructor arg, and a second call site here duplicating that update is
+    # exactly how the subagent's copy went missing in the first place.
 
     return Agent(
         loop=loop,
